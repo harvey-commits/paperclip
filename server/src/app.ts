@@ -8,6 +8,7 @@ import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
+import { authRateLimit, webhookRateLimit, apiRateLimit, agentKeyRateLimit } from "./middleware/rate-limit.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { healthRoutes } from "./routes/health.js";
 import { companyRoutes } from "./routes/companies.js";
@@ -105,7 +106,7 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
-  app.get("/api/auth/get-session", (req, res) => {
+  app.get("/api/auth/get-session", authRateLimit, (req, res) => {
     if (req.actor.type !== "board" || !req.actor.userId) {
       res.status(401).json({ error: "Unauthorized" });
       return;
@@ -123,12 +124,13 @@ export async function createApp(
     });
   });
   if (opts.betterAuthHandler) {
-    app.all("/api/auth/*authPath", opts.betterAuthHandler);
+    app.all("/api/auth/*authPath", authRateLimit, opts.betterAuthHandler);
   }
   app.use(llmRoutes(db));
 
   // Mount API routes
   const api = Router();
+  api.use(apiRateLimit);
   api.use(boardMutationGuard());
   api.use(
     "/health",

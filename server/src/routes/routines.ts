@@ -9,6 +9,7 @@ import {
   updateRoutineTriggerSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
+import { webhookRateLimit } from "../middleware/rate-limit.js";
 import { accessService, logActivity, routineService } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { forbidden, unauthorized } from "../errors.js";
@@ -283,7 +284,7 @@ export function routineRoutes(db: Db) {
     res.status(202).json(run);
   });
 
-  router.post("/routine-triggers/public/:publicId/fire", async (req, res) => {
+  router.post("/routine-triggers/public/:publicId/fire", webhookRateLimit, async (req, res) => {
     const result = await svc.firePublicTrigger(req.params.publicId as string, {
       authorizationHeader: req.header("authorization"),
       signatureHeader: req.header("x-paperclip-signature"),

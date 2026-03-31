@@ -49,6 +49,38 @@ import type { ToolRunContext } from "@paperclipai/plugin-sdk";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
+import { z } from "zod";
+import { validate } from "../middleware/validate.js";
+
+const pluginConfigBodySchema = z.object({
+  configJson: z.record(z.unknown()),
+});
+
+const pluginInstallSchema = z.object({
+  packageName: z
+    .string()
+    .min(1, "packageName cannot be empty")
+    .max(214, "packageName too long")
+    .refine(
+      (v) => !/[<>:"|?*;&$`\\]/.test(v),
+      "packageName contains invalid characters",
+    ),
+  version: z.string().max(64).optional(),
+  isLocalPath: z.boolean().optional(),
+});
+
+const pluginToolExecuteSchema = z.object({
+  tool: z.string().min(1, '"tool" is required and must be a string'),
+  parameters: z.record(z.unknown()).optional(),
+  runContext: z
+    .object({
+      agentId: z.string().min(1),
+      runId: z.string().min(1),
+      companyId: z.string().min(1),
+      projectId: z.string().min(1),
+    })
+    .passthrough(),
+});
 
 /** UI slot declaration extracted from plugin manifest */
 type PluginUiSlotDeclaration = NonNullable<NonNullable<PaperclipPluginManifestV1["ui"]>["slots"]>[number];
@@ -516,7 +548,7 @@ export function pluginRoutes(
    * - 501 if tool dispatcher is not configured
    * - 502 if the plugin worker is unavailable or the RPC call fails
    */
-  router.post("/plugins/tools/execute", async (req, res) => {
+  router.post("/plugins/tools/execute", validate(pluginToolExecuteSchema), async (req, res) => {
     assertBoard(req);
 
     if (!toolDeps) {
@@ -524,31 +556,7 @@ export function pluginRoutes(
       return;
     }
 
-    const body = (req.body as PluginToolExecuteRequest | undefined);
-    if (!body) {
-      res.status(400).json({ error: "Request body is required" });
-      return;
-    }
-
-    const { tool, parameters, runContext } = body;
-
-    // Validate required fields
-    if (!tool || typeof tool !== "string") {
-      res.status(400).json({ error: '"tool" is required and must be a string' });
-      return;
-    }
-
-    if (!runContext || typeof runContext !== "object") {
-      res.status(400).json({ error: '"runContext" is required and must be an object' });
-      return;
-    }
-
-    if (!runContext.agentId || !runContext.runId || !runContext.companyId || !runContext.projectId) {
-      res.status(400).json({
-        error: '"runContext" must include agentId, runId, companyId, and projectId',
-      });
-      return;
-    }
+    const { tool, parameters, runContext } = req.body as z.infer<typeof pluginToolExecuteSchema>;
 
     assertCompanyAccess(req, runContext.companyId);
 
@@ -600,38 +608,10 @@ export function pluginRoutes(
    * - `400` — validation failure or install error (package not found, bad manifest, etc.)
    * - `500` — installation succeeded but manifest is missing (indicates a loader bug)
    */
-  router.post("/plugins/install", async (req, res) => {
+  router.post("/plugins/install", validate(pluginInstallSchema), async (req, res) => {
     assertBoard(req);
-    const { packageName, version, isLocalPath } = req.body as PluginInstallRequest;
-
-    // Input validation
-    if (!packageName || typeof packageName !== "string") {
-      res.status(400).json({ error: "packageName is required and must be a string" });
-      return;
-    }
-
-    if (version !== undefined && typeof version !== "string") {
-      res.status(400).json({ error: "version must be a string if provided" });
-      return;
-    }
-
-    if (isLocalPath !== undefined && typeof isLocalPath !== "boolean") {
-      res.status(400).json({ error: "isLocalPath must be a boolean if provided" });
-      return;
-    }
-
-    // Validate package name format
+    const { packageName, version, isLocalPath } = req.body as z.infer<typeof pluginInstallSchema>;
     const trimmedPackage = packageName.trim();
-    if (trimmedPackage.length === 0) {
-      res.status(400).json({ error: "packageName cannot be empty" });
-      return;
-    }
-
-    // Basic security check for package name (prevent injection)
-    if (!isLocalPath && /[<>:"|?*]/.test(trimmedPackage)) {
-      res.status(400).json({ error: "packageName contains invalid characters" });
-      return;
-    }
 
     try {
       const installOptions = isLocalPath
@@ -1539,9 +1519,9 @@ export function pluginRoutes(
    * - 400 if request validation fails
    * - 404 if plugin not found
    */
-  router.post("/plugins/:pluginId/config", async (req, res) => {
+  router.post("/plugins/:pluginId/config", validate(pluginConfigBodySchema), async (req, res) => {
     assertBoard(req);
-    const { pluginId } = req.params;
+    const pluginId = req.params.pluginId as string;
 
     const plugin = await resolvePlugin(registry, pluginId);
     if (!plugin) {
@@ -1549,11 +1529,7 @@ export function pluginRoutes(
       return;
     }
 
-    const body = req.body as { configJson?: Record<string, unknown> } | undefined;
-    if (!body?.configJson || typeof body.configJson !== "object") {
-      res.status(400).json({ error: '"configJson" is required and must be an object' });
-      return;
-    }
+    const body = req.body as z.infer<typeof pluginConfigBodySchema>;
 
     // Strip devUiUrl unless the caller is an instance admin. devUiUrl activates
     // a dev-proxy in the static file route that could be abused for SSRF if any

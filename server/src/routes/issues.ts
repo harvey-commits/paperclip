@@ -34,6 +34,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { agentKeyRateLimit } from "../middleware/rate-limit.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
@@ -1254,7 +1255,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
     res.json(issue);
   });
 
-  router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {
+  router.post("/issues/:id/checkout", agentKeyRateLimit, validate(checkoutIssueSchema), async (req, res) => {
     const id = req.params.id as string;
     const issue = await svc.getById(id);
     if (!issue) {

@@ -40,6 +40,7 @@ import {
 } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
+import { authRateLimit } from "../middleware/rate-limit.js";
 import {
   accessService,
   agentService,
@@ -1598,7 +1599,7 @@ export function accessRoutes(
     res.json(challenge);
   });
 
-  router.post("/board-claim/:token/claim", async (req, res) => {
+  router.post("/board-claim/:token/claim", authRateLimit, async (req, res) => {
     const token = (req.params.token as string).trim();
     const code =
       typeof req.body?.code === "string" ? req.body.code.trim() : undefined;
@@ -1637,6 +1638,7 @@ export function accessRoutes(
 
   router.post(
     "/cli-auth/challenges",
+    authRateLimit,
     validate(createCliAuthChallengeSchema),
     async (req, res) => {
       const created = await boardAuth.createCliAuthChallenge(req.body);
@@ -2144,6 +2146,7 @@ export function accessRoutes(
 
   router.post(
     "/invites/:token/accept",
+    authRateLimit,
     validate(acceptInviteSchema),
     async (req, res) => {
       const token = (req.params.token as string).trim();
