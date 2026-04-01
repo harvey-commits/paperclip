@@ -41,12 +41,28 @@ const plugin = definePlugin({
       }
     }
 
-    // Subscribe to issue events for potential future bidirectional sync
+    // Bidirectional sync: push agent/user comments back to Telegram
     ctx.events.on("issue.comment.created", async (event) => {
-      // Phase 2: push agent comments back to Telegram
-      ctx.logger.debug("Issue comment created (bidirectional sync TBD)", {
-        issueId: event.entityId,
-      });
+      try {
+        await mapper.handleCommentCreated(event);
+      } catch (err) {
+        ctx.logger.error("Failed to push comment to Telegram", {
+          issueId: event.entityId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    });
+
+    // Status change notifications: push meaningful transitions to Telegram
+    ctx.events.on("issue.updated", async (event) => {
+      try {
+        await mapper.handleIssueUpdated(event);
+      } catch (err) {
+        ctx.logger.error("Failed to push status notification to Telegram", {
+          issueId: event.entityId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     });
 
     // Handle incoming updates

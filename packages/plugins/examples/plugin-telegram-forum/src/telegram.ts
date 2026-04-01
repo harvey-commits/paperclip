@@ -2,6 +2,7 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type {
   TelegramForumConfig,
   TelegramGetUpdatesResult,
+  TelegramSendMessageResult,
   TelegramUpdate,
 } from "./types.js";
 import type { MappingStore } from "./store.js";
@@ -87,13 +88,14 @@ export class TelegramClient {
 
   /**
    * Send a text message to a chat, optionally in a specific topic thread.
+   * Returns the sent message ID on success, or null on failure.
    */
   async sendMessage(
     chatId: string,
     text: string,
     messageThreadId?: number,
     replyToMessageId?: number
-  ): Promise<void> {
+  ): Promise<number | null> {
     const body: Record<string, unknown> = {
       chat_id: chatId,
       text,
@@ -117,6 +119,14 @@ export class TelegramClient {
         status: resp.status,
         body: redactBotToken(respBody, this.token),
       });
+      return null;
+    }
+
+    try {
+      const data = (await resp.json()) as TelegramSendMessageResult;
+      return data.ok ? data.result.message_id : null;
+    } catch {
+      return null;
     }
   }
 }

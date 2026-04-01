@@ -1,5 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import type { MessageIssueMapping, TopicProjectMapping } from "./types.js";
+import type { MessageIssueMapping, TopicProjectMapping, UserMapping } from "./types.js";
 
 const NAMESPACE = "telegram-forum";
 
@@ -128,6 +128,129 @@ export class MappingStore {
         stateKey: `thread-latest:${threadId}`,
       },
       mapping
+    );
+  }
+
+  // ── Sent-by-plugin tracking (loop prevention) ─────────────────────
+  // Tracks Telegram message IDs sent by this plugin so the poller
+  // can skip them and avoid creating duplicate comments.
+
+  async markSentByPlugin(chatId: string, messageId: number): Promise<void> {
+    await this.ctx.state.set(
+      {
+        scopeKind: "company",
+        scopeId: this.companyId,
+        namespace: NAMESPACE,
+        stateKey: `sentByPlugin:${chatId}:${messageId}`,
+      },
+      true
+    );
+  }
+
+  async isSentByPlugin(chatId: string, messageId: number): Promise<boolean> {
+    const val = await this.ctx.state.get({
+      scopeKind: "company",
+      scopeId: this.companyId,
+      namespace: NAMESPACE,
+      stateKey: `sentByPlugin:${chatId}:${messageId}`,
+    });
+    return val === true;
+  }
+
+  // ── User mappings (Telegram ↔ Paperclip) ──────────────────────────
+
+  async setUserMapping(
+    telegramUserId: string,
+    paperclipUserId: string,
+    telegramDisplayName: string | null = null
+  ): Promise<void> {
+    const mapping: UserMapping = {
+      telegramUserId,
+      paperclipUserId,
+      telegramDisplayName,
+      createdAt: new Date().toISOString(),
+    };
+    // Forward: Telegram userId → Paperclip userId
+    await this.ctx.state.set(
+      {
+        scopeKind: "company",
+        scopeId: this.companyId,
+        namespace: NAMESPACE,
+        stateKey: `user:${telegramUserId}`,
+      },
+      mapping
+    );
+    // Reverse: Paperclip userId → Telegram userId
+    await this.ctx.state.set(
+      {
+        scopeKind: "company",
+        scopeId: this.companyId,
+        namespace: NAMESPACE,
+        stateKey: `puser:${paperclipUserId}`,
+      },
+      mapping
+    );
+  }
+
+  async getUserMapping(
+    telegramUserId: string
+  ): Promise<UserMapping | null> {
+    const val = await this.ctx.state.get({
+      scopeKind: "company",
+      scopeId: this.companyId,
+      namespace: NAMESPACE,
+      stateKey: `user:${telegramUserId}`,
+    });
+    return (val as UserMapping) ?? null;
+  }
+
+  async getUserMappingByPaperclipId(
+    paperclipUserId: string
+  ): Promise<UserMapping | null> {
+    const val = await this.ctx.state.get({
+      scopeKind: "company",
+      scopeId: this.companyId,
+      namespace: NAMESPACE,
+      stateKey: `puser:${paperclipUserId}`,
+    });
+    return (val as UserMapping) ?? null;
+  }
+
+  // ── Plugin-initiated status change tracking ──────────────────────
+  // Tracks issue IDs where the plugin itself changed the status (e.g. /close)
+  // so the issue.updated event handler can skip the resulting notification.
+
+  async markPluginStatusChange(issueId: string): Promise<void> {
+    await this.ctx.state.set(
+      {
+        scopeKind: "company",
+        scopeId: this.companyId,
+        namespace: NAMESPACE,
+        stateKey: `pluginStatusChange:${issueId}`,
+      },
+      true
+    );
+  }
+
+  async isPluginStatusChange(issueId: string): Promise<boolean> {
+    const val = await this.ctx.state.get({
+      scopeKind: "company",
+      scopeId: this.companyId,
+      namespace: NAMESPACE,
+      stateKey: `pluginStatusChange:${issueId}`,
+    });
+    return val === true;
+  }
+
+  async clearPluginStatusChange(issueId: string): Promise<void> {
+    await this.ctx.state.set(
+      {
+        scopeKind: "company",
+        scopeId: this.companyId,
+        namespace: NAMESPACE,
+        stateKey: `pluginStatusChange:${issueId}`,
+      },
+      null
     );
   }
 

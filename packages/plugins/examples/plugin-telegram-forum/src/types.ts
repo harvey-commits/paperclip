@@ -93,3 +93,21 @@ export interface PaperclipIssueResponse {
   title: string;
   status: string;
 }
+
+/** A stored mapping between a Telegram user and a Paperclip user. */
+export interface UserMapping {
+  telegramUserId: string;
+  paperclipUserId: string;
+  telegramDisplayName: string | null;
+  createdAt: string;
+}
+
+/** Result from Telegram sendMessage API call. */
+export interface TelegramSendMessageResult {
+  ok: boolean;
+  result: {
+    message_id: number;
+    chat: TelegramChat;
+    text?: string;
+  };
+}

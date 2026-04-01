@@ -1,4 +1,4 @@
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import type { PluginContext, PluginEvent } from "@paperclipai/plugin-sdk";
 import type {
   TelegramForumConfig,
   TelegramMessage,
@@ -87,9 +87,42 @@ export class MessageMapper {
     // Only process messages from the configured chat
     if (String(message.chat.id) !== this.config.telegramChatId) return;
 
+    // Loop prevention: skip messages that were sent by this plugin
+    const chatId = String(message.chat.id);
+    if (await this.store.isSentByPlugin(chatId, message.message_id)) {
+      this.ctx.logger.debug("Skipping message sent by plugin (loop prevention)", {
+        messageId: message.message_id,
+      });
+      return;
+    }
+
+    // Check for /whoami command
+    if (message.text.startsWith("/whoami")) {
+      await this.handleWhoamiCommand(message);
+      return;
+    }
+
     // Check for /new command
     if (message.text.startsWith("/new ")) {
       await this.handleNewCommand(message);
+      return;
+    }
+
+    // Check for /status command
+    if (message.text === "/status" || message.text.startsWith("/status ")) {
+      await this.handleStatusCommand(message);
+      return;
+    }
+
+    // Check for /assign command
+    if (message.text.startsWith("/assign ")) {
+      await this.handleAssignCommand(message);
+      return;
+    }
+
+    // Check for /close command
+    if (message.text === "/close" || message.text.startsWith("/close ")) {
+      await this.handleCloseCommand(message);
       return;
     }
 
@@ -100,6 +133,63 @@ export class MessageMapper {
     } else if (message.message_thread_id) {
       await this.handleTopLevelMessage(message);
     }
+  }
+
+  /**
+   * Handle /whoami command: look up the sender's Telegram-to-Paperclip mapping
+   * and reply with their Paperclip userId and display name, or "not mapped yet".
+   */
+  private async handleWhoamiCommand(message: TelegramMessage): Promise<void> {
+    if (!message.from) {
+      await this.telegram.sendMessage(
+        this.config.telegramChatId,
+        "Could not identify your Telegram account.",
+        message.message_thread_id,
+        message.message_id
+      );
+      return;
+    }
+
+    const telegramUserId = String(message.from.id);
+    const mapping = await this.store.getUserMapping(telegramUserId);
+
+    let reply: string;
+    if (mapping) {
+      const displayParts = [`Paperclip userId: ${mapping.paperclipUserId}`];
+      if (mapping.telegramDisplayName) {
+        displayParts.push(`Display name: ${mapping.telegramDisplayName}`);
+      }
+      reply = `You are mapped!\n${displayParts.join("\n")}`;
+    } else {
+      reply = `Not mapped yet. Your Telegram ID is ${telegramUserId}.`;
+    }
+
+    await this.telegram.sendMessage(
+      this.config.telegramChatId,
+      reply,
+      message.message_thread_id,
+      message.message_id
+    );
+  }
+
+  /**
+   * Resolve the Paperclip userId for a Telegram message sender.
+   * Returns null if the user is not mapped.
+   */
+  private async resolveUserId(
+    message: TelegramMessage
+  ): Promise<string | null> {
+    if (!message.from) return null;
+
+    const telegramUserId = String(message.from.id);
+    const mapping = await this.store.getUserMapping(telegramUserId);
+    if (mapping) return mapping.paperclipUserId;
+
+    this.ctx.logger.warn("No user mapping for Telegram user", {
+      telegramUserId,
+      telegramName: message.from.first_name,
+    });
+    return null;
   }
 
   /**
@@ -135,6 +225,7 @@ export class MessageMapper {
 
     const senderName = formatSenderName(message);
     const description = `Created via Telegram /new command by ${senderName}`;
+    const createdByUserId = await this.resolveUserId(message);
 
     const issue = await this.createPaperclipIssue({
       title,
@@ -142,6 +233,7 @@ export class MessageMapper {
       projectId,
       chatId: String(message.chat.id),
       messageId: message.message_id,
+      createdByUserId,
     });
 
     if (issue) {
@@ -201,6 +293,7 @@ export class MessageMapper {
     const title = truncate(sanitizeInput(message.text!), 100);
     const senderName = formatSenderName(message);
     const description = `${sanitizeInput(message.text!)}\n\n---\n_Sent by ${senderName} in Telegram_`;
+    const createdByUserId = await this.resolveUserId(message);
 
     const issue = await this.createPaperclipIssue({
       title,
@@ -208,6 +301,7 @@ export class MessageMapper {
       projectId,
       chatId,
       messageId: message.message_id,
+      createdByUserId,
     });
 
     if (issue) {
@@ -265,13 +359,14 @@ export class MessageMapper {
     }
 
     const senderName = formatSenderName(message);
+    const userId = await this.resolveUserId(message);
     const commentBody = `**${senderName}** (via Telegram):\n\n${sanitizeInput(message.text!)}`;
 
     try {
-      await this.ctx.issues.createComment(
+      await this.createPaperclipComment(
         mapping.paperclipIssueId,
         commentBody,
-        this.config.paperclipCompanyId
+        userId
       );
 
       // Save mapping for the reply message to enable dedup and threading
@@ -294,6 +389,360 @@ export class MessageMapper {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  /**
+   * Handle an issue.comment.created event by pushing the comment to Telegram.
+   * Skips issues not originating from Telegram and prevents loops.
+   */
+  async handleCommentCreated(event: PluginEvent): Promise<void> {
+    // Skip events from plugins to prevent loops
+    if (event.actorType === "plugin") return;
+
+    const issueId = event.entityId;
+    if (!issueId) return;
+
+    // Fetch the issue to check origin
+    const issue = await this.ctx.issues.get(issueId, this.config.paperclipCompanyId);
+    if (!issue) return;
+
+    // Only sync comments on Telegram-originated issues
+    if (issue.originKind !== "telegram" || !issue.originId) return;
+
+    // Parse originId: "{chatId}:{messageId}"
+    const colonIdx = issue.originId.indexOf(":");
+    if (colonIdx === -1) return;
+    const originChatId = issue.originId.slice(0, colonIdx);
+    const originMessageId = Number(issue.originId.slice(colonIdx + 1));
+    if (!originChatId || Number.isNaN(originMessageId)) return;
+
+    // Verify the origin chat matches our configured chat
+    if (originChatId !== this.config.telegramChatId) return;
+
+    // Extract comment body from the event payload
+    const payload = event.payload as Record<string, unknown> | undefined;
+    const commentBody = (payload as { body?: string } | undefined)?.body
+      ?? (payload as { comment?: { body?: string } } | undefined)?.comment?.body;
+    if (!commentBody) {
+      this.ctx.logger.debug("No comment body in event payload, skipping", {
+        issueId,
+      });
+      return;
+    }
+
+    // Resolve author name for the Telegram message
+    let authorName = "Agent";
+    if (event.actorType === "agent" && event.actorId) {
+      const agent = await this.ctx.agents.get(
+        event.actorId,
+        this.config.paperclipCompanyId
+      );
+      if (agent) authorName = agent.name;
+    } else if (event.actorType === "user") {
+      authorName = "User";
+    }
+
+    // Format message for Telegram (keep markdown Telegram-compatible)
+    const formattedText = `${authorName}:\n\n${commentBody}`;
+
+    // Look up the mapping to get thread info for the reply
+    const mapping = await this.store.getMessageByIssue(issueId);
+    const messageThreadId = mapping?.messageThreadId;
+
+    // Send as a reply to the original message in the thread
+    const sentMessageId = await this.telegram.sendMessage(
+      this.config.telegramChatId,
+      formattedText,
+      messageThreadId,
+      originMessageId
+    );
+
+    // Track the sent message for loop prevention
+    if (sentMessageId !== null) {
+      await this.store.markSentByPlugin(this.config.telegramChatId, sentMessageId);
+      this.ctx.logger.info("Pushed comment to Telegram", {
+        issueId,
+        sentMessageId,
+        threadId: messageThreadId,
+      });
+    }
+  }
+
+  /**
+   * Handle /status command: look up the linked issue and reply with its current state.
+   */
+  private async handleStatusCommand(message: TelegramMessage): Promise<void> {
+    const topicKey = `topic:${message.message_thread_id ?? "general"}`;
+    if (!this.rateLimiter.allow(topicKey)) return;
+
+    const mapping = await this.resolveIssueForCommand(message);
+    if (!mapping) {
+      await this.telegram.sendMessage(
+        this.config.telegramChatId,
+        "No linked issue found in this thread.",
+        message.message_thread_id,
+        message.message_id
+      );
+      return;
+    }
+
+    try {
+      const issue = await this.ctx.issues.get(
+        mapping.paperclipIssueId,
+        this.config.paperclipCompanyId
+      );
+      if (!issue) {
+        await this.telegram.sendMessage(
+          this.config.telegramChatId,
+          "Issue not found.",
+          message.message_thread_id,
+          message.message_id
+        );
+        return;
+      }
+
+      const label = issue.identifier ?? issue.id.slice(0, 8);
+      const lines = [
+        `${label}: ${issue.title}`,
+        `Status: ${issue.status}`,
+        `Priority: ${issue.priority}`,
+      ];
+      if (issue.assigneeAgentId) {
+        const agent = await this.ctx.agents.get(
+          issue.assigneeAgentId,
+          this.config.paperclipCompanyId
+        );
+        lines.push(`Assignee: ${agent?.name ?? issue.assigneeAgentId}`);
+      }
+
+      await this.telegram.sendMessage(
+        this.config.telegramChatId,
+        lines.join("\n"),
+        message.message_thread_id,
+        message.message_id
+      );
+    } catch (err) {
+      this.ctx.logger.error("Failed to handle /status command", {
+        issueId: mapping.paperclipIssueId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Handle /assign command: reassign the linked issue to a named agent.
+   */
+  private async handleAssignCommand(message: TelegramMessage): Promise<void> {
+    const topicKey = `topic:${message.message_thread_id ?? "general"}`;
+    if (!this.rateLimiter.allow(topicKey)) return;
+
+    const rawArg = message.text!.slice("/assign ".length).trim();
+    const agentName = rawArg.replace(/^@/, "");
+    if (!agentName) {
+      await this.telegram.sendMessage(
+        this.config.telegramChatId,
+        "Usage: /assign @agent-name",
+        message.message_thread_id,
+        message.message_id
+      );
+      return;
+    }
+
+    const mapping = await this.resolveIssueForCommand(message);
+    if (!mapping) {
+      await this.telegram.sendMessage(
+        this.config.telegramChatId,
+        "No linked issue found in this thread.",
+        message.message_thread_id,
+        message.message_id
+      );
+      return;
+    }
+
+    try {
+      const agents = await this.ctx.agents.list({
+        companyId: this.config.paperclipCompanyId,
+      });
+      const nameLower = agentName.toLowerCase();
+      const match = agents.find(
+        (a) =>
+          a.name.toLowerCase() === nameLower ||
+          a.urlKey?.toLowerCase() === nameLower
+      );
+      if (!match) {
+        await this.telegram.sendMessage(
+          this.config.telegramChatId,
+          `Agent "${sanitizeInput(agentName)}" not found.`,
+          message.message_thread_id,
+          message.message_id
+        );
+        return;
+      }
+
+      await this.ctx.issues.update(
+        mapping.paperclipIssueId,
+        { assigneeAgentId: match.id },
+        this.config.paperclipCompanyId
+      );
+
+      const label = mapping.paperclipIssueIdentifier ?? mapping.paperclipIssueId.slice(0, 8);
+      await this.telegram.sendMessage(
+        this.config.telegramChatId,
+        `${label} assigned to ${match.name}.`,
+        message.message_thread_id,
+        message.message_id
+      );
+    } catch (err) {
+      this.ctx.logger.error("Failed to handle /assign command", {
+        issueId: mapping.paperclipIssueId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Handle /close command: mark the linked issue as done.
+   */
+  private async handleCloseCommand(message: TelegramMessage): Promise<void> {
+    const topicKey = `topic:${message.message_thread_id ?? "general"}`;
+    if (!this.rateLimiter.allow(topicKey)) return;
+
+    const mapping = await this.resolveIssueForCommand(message);
+    if (!mapping) {
+      await this.telegram.sendMessage(
+        this.config.telegramChatId,
+        "No linked issue found in this thread.",
+        message.message_thread_id,
+        message.message_id
+      );
+      return;
+    }
+
+    try {
+      const senderName = formatSenderName(message);
+
+      await this.ctx.issues.update(
+        mapping.paperclipIssueId,
+        { status: "done" },
+        this.config.paperclipCompanyId
+      );
+
+      // Track this status change as plugin-initiated for loop prevention
+      await this.store.markPluginStatusChange(mapping.paperclipIssueId);
+
+      // Post a closing comment via API
+      await this.createPaperclipComment(
+        mapping.paperclipIssueId,
+        `Closed via Telegram /close command by ${senderName}.`,
+        await this.resolveUserId(message)
+      );
+
+      const label = mapping.paperclipIssueIdentifier ?? mapping.paperclipIssueId.slice(0, 8);
+      await this.telegram.sendMessage(
+        this.config.telegramChatId,
+        `${label} closed.`,
+        message.message_thread_id,
+        message.message_id
+      );
+    } catch (err) {
+      this.ctx.logger.error("Failed to handle /close command", {
+        issueId: mapping.paperclipIssueId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Handle an issue.updated event by pushing status change notifications to Telegram.
+   * Only notifies on meaningful transitions (done, blocked, in_progress).
+   * Skips plugin-initiated changes to avoid notification loops.
+   */
+  async handleIssueUpdated(event: PluginEvent): Promise<void> {
+    // Skip events from plugins to prevent loops
+    if (event.actorType === "plugin") return;
+
+    const issueId = event.entityId;
+    if (!issueId) return;
+
+    // Check payload for status change
+    const payload = event.payload as Record<string, unknown> | undefined;
+    const newStatus = (payload as { status?: string } | undefined)?.status
+      ?? (payload as { changes?: { status?: string } } | undefined)?.changes?.status;
+    if (!newStatus) return;
+
+    // Only notify on meaningful transitions
+    const notifyStatuses = ["done", "blocked", "in_progress"];
+    if (!notifyStatuses.includes(newStatus)) return;
+
+    // Extra loop prevention: skip if this was a plugin-initiated status change (/close)
+    if (await this.store.isPluginStatusChange(issueId)) {
+      await this.store.clearPluginStatusChange(issueId);
+      return;
+    }
+
+    // Fetch the issue to check origin
+    const issue = await this.ctx.issues.get(issueId, this.config.paperclipCompanyId);
+    if (!issue) return;
+
+    // Only sync for Telegram-originated issues
+    if (issue.originKind !== "telegram" || !issue.originId) return;
+
+    // Parse originId
+    const colonIdx = issue.originId.indexOf(":");
+    if (colonIdx === -1) return;
+    const originChatId = issue.originId.slice(0, colonIdx);
+    const originMessageId = Number(issue.originId.slice(colonIdx + 1));
+    if (!originChatId || Number.isNaN(originMessageId)) return;
+
+    if (originChatId !== this.config.telegramChatId) return;
+
+    // Resolve actor name
+    let actorName = "System";
+    if (event.actorType === "agent" && event.actorId) {
+      const agent = await this.ctx.agents.get(
+        event.actorId,
+        this.config.paperclipCompanyId
+      );
+      if (agent) actorName = agent.name;
+    } else if (event.actorType === "user") {
+      actorName = "User";
+    }
+
+    const label = issue.identifier ?? issue.id.slice(0, 8);
+    const statusLabel = newStatus === "in_progress" ? "in progress" : newStatus;
+    const text = `${label} marked as ${statusLabel} by ${actorName}`;
+
+    // Look up the mapping to get thread info
+    const mapping = await this.store.getMessageByIssue(issueId);
+    const messageThreadId = mapping?.messageThreadId;
+
+    const sentMessageId = await this.telegram.sendMessage(
+      this.config.telegramChatId,
+      text,
+      messageThreadId,
+      originMessageId
+    );
+
+    if (sentMessageId !== null) {
+      await this.store.markSentByPlugin(this.config.telegramChatId, sentMessageId);
+    }
+  }
+
+  /**
+   * Resolve the linked issue for a command message.
+   * If the command is a reply → walk the reply chain.
+   * Otherwise → use the thread-level latest issue.
+   */
+  private async resolveIssueForCommand(
+    message: TelegramMessage
+  ): Promise<{ paperclipIssueId: string; paperclipIssueIdentifier: string | null } | null> {
+    if (message.reply_to_message && !message.reply_to_message.forum_topic_created) {
+      return this.resolveIssueForReply(message);
+    }
+    if (message.message_thread_id !== undefined) {
+      return this.store.getLatestIssueByThread(message.message_thread_id);
+    }
+    return null;
   }
 
   /**
@@ -419,6 +868,7 @@ export class MessageMapper {
 
   /**
    * Create a Paperclip issue via the REST API (to include originKind/originId).
+   * Passes createdByUserId when a user mapping exists for the Telegram sender.
    */
   private async createPaperclipIssue(input: {
     title: string;
@@ -426,8 +876,22 @@ export class MessageMapper {
     projectId: string;
     chatId: string;
     messageId: number;
+    createdByUserId: string | null;
   }): Promise<PaperclipIssueResponse | null> {
     try {
+      const issueBody: Record<string, unknown> = {
+        title: input.title,
+        description: input.description,
+        projectId: input.projectId,
+        originKind: "telegram",
+        originId: `${input.chatId}:${input.messageId}`,
+        status: "todo",
+        priority: "medium",
+      };
+      if (input.createdByUserId) {
+        issueBody.createdByUserId = input.createdByUserId;
+      }
+
       const resp = await this.ctx.http.fetch(
         `${this.config.paperclipApiUrl}/api/companies/${this.config.paperclipCompanyId}/issues`,
         {
@@ -436,15 +900,7 @@ export class MessageMapper {
             "Content-Type": "application/json",
             Authorization: `Bearer ${this.config.paperclipApiKey}`,
           },
-          body: JSON.stringify({
-            title: input.title,
-            description: input.description,
-            projectId: input.projectId,
-            originKind: "telegram",
-            originId: `${input.chatId}:${input.messageId}`,
-            status: "todo",
-            priority: "medium",
-          }),
+          body: JSON.stringify(issueBody),
         }
       );
 
@@ -463,6 +919,38 @@ export class MessageMapper {
         error: err instanceof Error ? err.message : String(err),
       });
       return null;
+    }
+  }
+
+  /**
+   * Create a comment on a Paperclip issue via the REST API.
+   * Uses HTTP fetch to allow passing userId for attribution.
+   */
+  private async createPaperclipComment(
+    issueId: string,
+    body: string,
+    userId: string | null
+  ): Promise<void> {
+    const commentBody: Record<string, unknown> = { body };
+    if (userId) {
+      commentBody.authorUserId = userId;
+    }
+
+    const resp = await this.ctx.http.fetch(
+      `${this.config.paperclipApiUrl}/api/issues/${issueId}/comments`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.config.paperclipApiKey}`,
+        },
+        body: JSON.stringify(commentBody),
+      }
+    );
+
+    if (!resp.ok) {
+      const respBody = await resp.text();
+      throw new Error(`Failed to create comment (${resp.status}): ${respBody}`);
     }
   }
 }

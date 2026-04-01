@@ -9,8 +9,9 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "Telegram Forum Integration",
   description:
-    "Syncs Telegram forum topics to Paperclip issue tracking. " +
-    "Top-level messages become issues, replies become comments, and /new creates fresh issues.",
+    "Bidirectional sync between Telegram forum topics and Paperclip issue tracking. " +
+    "Top-level messages become issues, replies become comments, /new creates fresh issues, " +
+    "and agent comments are pushed back to Telegram threads.",
   author: "Paperclip",
   categories: ["connector", "automation"],
   capabilities: [
@@ -20,6 +21,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.read",
     "issue.comments.create",
     "issue.comments.read",
+    "agents.read",
     "events.subscribe",
     "http.outbound",
     "plugin.state.read",
