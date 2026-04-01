@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ISSUE_PRIORITIES, ISSUE_STATUSES } from "../constants.js";
+import { ISSUE_ORIGIN_KINDS, ISSUE_PRIORITIES, ISSUE_STATUSES } from "../constants.js";
 
 const executionWorkspaceStrategySchema = z
   .object({
@@ -52,6 +52,7 @@ export const createIssueSchema = z.object({
     "agent_default",
   ]).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
+  originKind: z.enum(ISSUE_ORIGIN_KINDS).optional(),
   labelIds: z.array(z.string().uuid()).optional(),
 });
 
