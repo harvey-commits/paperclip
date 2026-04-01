@@ -58,6 +58,10 @@ export class MappingStore {
       },
       mapping
     );
+    // Update thread-level latest issue index for nested reply fallback
+    if (mapping.messageThreadId !== undefined) {
+      await this.saveThreadLatestIssue(mapping.messageThreadId, mapping);
+    }
   }
 
   async getMessageByIssue(
@@ -94,6 +98,37 @@ export class MappingStore {
 
   async saveTopicMapping(mapping: TopicProjectMapping): Promise<void> {
     await this.ctx.state.set(this.topicMappingKey(mapping.messageThreadId), mapping);
+  }
+
+  // ── Thread → latest issue mapping ─────────────────────────────────
+  // Used as a fallback when a reply's direct parent isn't mapped
+  // (nested replies, out-of-order delivery, etc.)
+
+  async getLatestIssueByThread(
+    threadId: number
+  ): Promise<MessageIssueMapping | null> {
+    const val = await this.ctx.state.get({
+      scopeKind: "company",
+      scopeId: this.companyId,
+      namespace: NAMESPACE,
+      stateKey: `thread-latest:${threadId}`,
+    });
+    return (val as MessageIssueMapping) ?? null;
+  }
+
+  async saveThreadLatestIssue(
+    threadId: number,
+    mapping: MessageIssueMapping
+  ): Promise<void> {
+    await this.ctx.state.set(
+      {
+        scopeKind: "company",
+        scopeId: this.companyId,
+        namespace: NAMESPACE,
+        stateKey: `thread-latest:${threadId}`,
+      },
+      mapping
+    );
   }
 
   // ── Polling offset persistence ────────────────────────────────────

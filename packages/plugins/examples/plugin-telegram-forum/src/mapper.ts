@@ -8,6 +8,47 @@ import type { MappingStore } from "./store.js";
 import type { TelegramClient } from "./telegram.js";
 
 /**
+ * Simple sliding-window rate limiter.
+ * Tracks timestamps of recent actions per key and rejects when the
+ * window limit is exceeded.
+ */
+class RateLimiter {
+  private windows = new Map<string, number[]>();
+  private maxPerWindow: number;
+  private windowMs: number;
+
+  constructor(maxPerWindow: number, windowMs = 60_000) {
+    this.maxPerWindow = maxPerWindow;
+    this.windowMs = windowMs;
+  }
+
+  /** Returns true if the action is allowed, false if rate-limited. */
+  allow(key: string): boolean {
+    const now = Date.now();
+    const cutoff = now - this.windowMs;
+
+    let timestamps = this.windows.get(key);
+    if (timestamps) {
+      timestamps = timestamps.filter((t) => t > cutoff);
+    } else {
+      timestamps = [];
+    }
+
+    if (timestamps.length >= this.maxPerWindow) {
+      this.windows.set(key, timestamps);
+      return false;
+    }
+
+    timestamps.push(now);
+    this.windows.set(key, timestamps);
+    return true;
+  }
+}
+
+/** Max issues + comments created per topic per minute. */
+const RATE_LIMIT_PER_TOPIC = 10;
+
+/**
  * Handles the mapping logic between Telegram messages and Paperclip issues/comments.
  */
 export class MessageMapper {
@@ -15,6 +56,7 @@ export class MessageMapper {
   private config: TelegramForumConfig;
   private store: MappingStore;
   private telegram: TelegramClient;
+  private rateLimiter = new RateLimiter(RATE_LIMIT_PER_TOPIC);
 
   constructor(
     ctx: PluginContext,
@@ -82,6 +124,15 @@ export class MessageMapper {
       return;
     }
 
+    // Rate limit: prevent abuse from a single topic
+    const topicKey = `topic:${message.message_thread_id ?? "general"}`;
+    if (!this.rateLimiter.allow(topicKey)) {
+      this.ctx.logger.warn("Rate limited /new command", {
+        threadId: message.message_thread_id,
+      });
+      return;
+    }
+
     const senderName = formatSenderName(message);
     const description = `Created via Telegram /new command by ${senderName}`;
 
@@ -138,6 +189,15 @@ export class MessageMapper {
       return;
     }
 
+    // Rate limit: prevent abuse from a single topic
+    const topicKey = `topic:${message.message_thread_id ?? "general"}`;
+    if (!this.rateLimiter.allow(topicKey)) {
+      this.ctx.logger.warn("Rate limited issue creation", {
+        threadId: message.message_thread_id,
+      });
+      return;
+    }
+
     const title = truncate(sanitizeInput(message.text!), 100);
     const senderName = formatSenderName(message);
     const description = `${sanitizeInput(message.text!)}\n\n---\n_Sent by ${senderName} in Telegram_`;
@@ -170,6 +230,8 @@ export class MessageMapper {
 
   /**
    * Handle a reply to a message → post as a comment on the mapped issue.
+   * Walks up the reply chain and falls back to the thread-level latest issue
+   * when the direct parent message is not in the mapping store.
    */
   private async handleReply(message: TelegramMessage): Promise<void> {
     if (!message.reply_to_message) return;
@@ -180,15 +242,24 @@ export class MessageMapper {
     const existingReply = await this.store.getIssueByMessage(chatId, message.message_id);
     if (existingReply) return;
 
-    const replyToId = message.reply_to_message.message_id;
-
-    // Find the issue this reply maps to
-    const mapping = await this.store.getIssueByMessage(chatId, replyToId);
+    // Walk up the reply chain to find a mapped issue:
+    // 1. Direct parent message
+    // 2. Grandparent message (if Telegram included nested reply_to_message)
+    // 3. Thread-level latest issue fallback
+    const mapping = await this.resolveIssueForReply(message);
     if (!mapping) {
-      // The parent message may not have been tracked.
-      // Try treating it as a top-level message instead.
-      this.ctx.logger.debug("Reply to unmapped message, skipping", {
-        replyToId,
+      this.ctx.logger.debug("Reply to unmapped message, no fallback found", {
+        replyToId: message.reply_to_message.message_id,
+        threadId: message.message_thread_id,
+      });
+      return;
+    }
+
+    // Rate limit: prevent abuse from a single topic
+    const topicKey = `topic:${message.message_thread_id ?? "general"}`;
+    if (!this.rateLimiter.allow(topicKey)) {
+      this.ctx.logger.warn("Rate limited comment creation", {
+        threadId: message.message_thread_id,
       });
       return;
     }
@@ -223,6 +294,47 @@ export class MessageMapper {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  /**
+   * Walk up the reply chain to find a mapped issue for a reply message.
+   * Checks: direct parent → grandparent → thread-level latest issue.
+   */
+  private async resolveIssueForReply(
+    message: TelegramMessage
+  ): Promise<{ paperclipIssueId: string; paperclipIssueIdentifier: string | null } | null> {
+    const chatId = String(message.chat.id);
+    const parent = message.reply_to_message;
+    if (!parent) return null;
+
+    // 1. Direct parent
+    const direct = await this.store.getIssueByMessage(chatId, parent.message_id);
+    if (direct) return direct;
+
+    // 2. Grandparent — Telegram may include reply_to_message on the parent
+    if (parent.reply_to_message) {
+      const grandparent = await this.store.getIssueByMessage(
+        chatId,
+        parent.reply_to_message.message_id
+      );
+      if (grandparent) return grandparent;
+    }
+
+    // 3. Thread-level fallback — find the most recently mapped issue in this thread
+    if (message.message_thread_id !== undefined) {
+      const threadFallback = await this.store.getLatestIssueByThread(
+        message.message_thread_id
+      );
+      if (threadFallback) {
+        this.ctx.logger.debug("Using thread-level fallback for nested reply", {
+          threadId: message.message_thread_id,
+          fallbackIssueId: threadFallback.paperclipIssueId,
+        });
+        return threadFallback;
+      }
+    }
+
+    return null;
   }
 
   /**

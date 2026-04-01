@@ -9,8 +9,20 @@ import type { MappingStore } from "./store.js";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 
 /**
+ * Redact a Telegram bot token from a string (URL, error message, etc.).
+ * Replaces `/bot<token>/` with `/bot<REDACTED>/`.
+ */
+export function redactBotToken(input: string, token: string): string {
+  if (!token) return input;
+  return input.replaceAll(token, "<REDACTED>");
+}
+
+/**
  * Minimal Telegram Bot API client using the plugin SDK's HTTP client.
  * Uses long polling via getUpdates.
+ *
+ * All fetch calls are wrapped to ensure the bot token is never leaked
+ * in error messages or logs.
  */
 export class TelegramClient {
   private token: string;
@@ -25,6 +37,25 @@ export class TelegramClient {
     return `${TELEGRAM_API_BASE}/bot${this.token}/${method}`;
   }
 
+  /** Token-safe fetch wrapper. Redacts the bot token from any thrown errors. */
+  private async safeFetch(
+    url: string,
+    init?: RequestInit
+  ): Promise<Response> {
+    try {
+      return await this.ctx.http.fetch(url, init);
+    } catch (err) {
+      if (err instanceof Error) {
+        const safe = new Error(redactBotToken(err.message, this.token));
+        safe.stack = err.stack
+          ? redactBotToken(err.stack, this.token)
+          : undefined;
+        throw safe;
+      }
+      throw err;
+    }
+  }
+
   /**
    * Fetch updates from Telegram using long polling.
    * @param offset - Pass the last update_id + 1 to acknowledge previous updates.
@@ -36,13 +67,15 @@ export class TelegramClient {
     params.set("timeout", String(timeout));
     params.set("allowed_updates", JSON.stringify(["message"]));
 
-    const resp = await this.ctx.http.fetch(
+    const resp = await this.safeFetch(
       `${this.url("getUpdates")}?${params.toString()}`
     );
 
     if (!resp.ok) {
       const body = await resp.text();
-      throw new Error(`Telegram getUpdates failed (${resp.status}): ${body}`);
+      throw new Error(
+        `Telegram getUpdates failed (${resp.status}): ${redactBotToken(body, this.token)}`
+      );
     }
 
     const data = (await resp.json()) as TelegramGetUpdatesResult;
@@ -72,7 +105,7 @@ export class TelegramClient {
       body.reply_to_message_id = replyToMessageId;
     }
 
-    const resp = await this.ctx.http.fetch(this.url("sendMessage"), {
+    const resp = await this.safeFetch(this.url("sendMessage"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -82,7 +115,7 @@ export class TelegramClient {
       const respBody = await resp.text();
       this.ctx.logger.error("sendMessage failed", {
         status: resp.status,
-        body: respBody,
+        body: redactBotToken(respBody, this.token),
       });
     }
   }
