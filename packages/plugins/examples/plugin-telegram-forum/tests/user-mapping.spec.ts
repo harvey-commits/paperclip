@@ -248,7 +248,7 @@ describe("/whoami command", () => {
   it("does not create issues for /whoami command", async () => {
     const { mapper, harness } = buildTestMapper();
 
-    const fetchSpy = vi.spyOn(harness.ctx.http, "fetch");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}"));
 
     const message = makeTelegramMessage({ text: "/whoami" });
     await mapper.handleMessage(message);
@@ -258,6 +258,7 @@ describe("/whoami command", () => {
       ([url]) => typeof url === "string" && url.includes("/api/companies/") && url.includes("/issues")
     );
     expect(issueCalls).toHaveLength(0);
+    fetchSpy.mockRestore();
   });
 
   it("skips /whoami from bots", async () => {
@@ -277,7 +278,7 @@ describe("/whoami command", () => {
 
 describe("user attribution", () => {
   it("includes createdByUserId in issue creation when user is mapped", async () => {
-    const { mapper, store, harness } = buildTestMapper();
+    const { mapper, store } = buildTestMapper();
 
     await store.setUserMapping(TELEGRAM_USER_ID, PAPERCLIP_USER_ID, "Alice");
 
@@ -289,7 +290,7 @@ describe("user attribution", () => {
       createdAt: new Date().toISOString(),
     });
 
-    const fetchSpy = vi.spyOn(harness.ctx.http, "fetch").mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
         JSON.stringify({ id: "new-issue", identifier: "TST-2", title: "Test", status: "todo" }),
         { status: 200, headers: { "Content-Type": "application/json" } }
@@ -306,10 +307,11 @@ describe("user attribution", () => {
     expect(issueCall).toBeDefined();
     const body = JSON.parse(issueCall![1]!.body as string);
     expect(body.createdByUserId).toBe(PAPERCLIP_USER_ID);
+    fetchSpy.mockRestore();
   });
 
   it("omits createdByUserId when user is not mapped", async () => {
-    const { mapper, store, harness } = buildTestMapper();
+    const { mapper, store } = buildTestMapper();
 
     await store.saveTopicMapping({
       messageThreadId: 100,
@@ -318,7 +320,7 @@ describe("user attribution", () => {
       createdAt: new Date().toISOString(),
     });
 
-    const fetchSpy = vi.spyOn(harness.ctx.http, "fetch").mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
         JSON.stringify({ id: "new-issue", identifier: "TST-3", title: "Test", status: "todo" }),
         { status: 200, headers: { "Content-Type": "application/json" } }
@@ -334,5 +336,146 @@ describe("user attribution", () => {
     expect(issueCall).toBeDefined();
     const body = JSON.parse(issueCall![1]!.body as string);
     expect(body.createdByUserId).toBeUndefined();
+    fetchSpy.mockRestore();
+  });
+});
+
+// ── Auto-assignment via topicAgentMap ─────────────────────────────
+
+describe("topicAgentMap auto-assignment", () => {
+  function buildTestMapperWithAgentMap(agentMap: Record<string, string>) {
+    const config: TelegramForumConfig = {
+      ...makeConfig(),
+      topicAgentMap: agentMap,
+    };
+    const harness = createTestHarness({
+      manifest,
+      capabilities: [...manifest.capabilities],
+      config,
+    });
+
+    harness.seed({ issues: [makeIssue()], agents: [makeAgent()] });
+
+    const store = new MappingStore(harness.ctx, COMPANY_ID);
+    const telegram = new TelegramClient(harness.ctx, BOT_TOKEN);
+    const sendMessageSpy = vi.spyOn(telegram, "sendMessage").mockResolvedValue(SENT_MESSAGE_ID);
+
+    const mapper = new MessageMapper(harness.ctx, config, store, telegram);
+
+    return { harness, mapper, store, telegram, sendMessageSpy, config };
+  }
+
+  it("includes assigneeAgentId when topicAgentMap maps the thread (top-level message)", async () => {
+    const targetAgent = "agent-auto-assigned-001";
+    const { mapper, store } = buildTestMapperWithAgentMap({ "100": targetAgent });
+
+    await store.saveTopicMapping({
+      messageThreadId: 100,
+      projectId: "proj-001",
+      projectName: "Test Project",
+      createdAt: new Date().toISOString(),
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ id: "new-issue", identifier: "TST-10", title: "Test", status: "todo" }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    await mapper.handleMessage(makeTelegramMessage({ text: "Auto-assign me" }));
+
+    const issueCall = fetchSpy.mock.calls.find(
+      ([url]) => typeof url === "string" && url.includes("/api/companies/") && url.includes("/issues")
+    );
+    expect(issueCall).toBeDefined();
+    const body = JSON.parse(issueCall![1]!.body as string);
+    expect(body.assigneeAgentId).toBe(targetAgent);
+    fetchSpy.mockRestore();
+  });
+
+  it("includes assigneeAgentId when topicAgentMap maps the thread (/new command)", async () => {
+    const targetAgent = "agent-auto-assigned-002";
+    const { mapper, store } = buildTestMapperWithAgentMap({ "100": targetAgent });
+
+    await store.saveTopicMapping({
+      messageThreadId: 100,
+      projectId: "proj-001",
+      projectName: "Test Project",
+      createdAt: new Date().toISOString(),
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ id: "new-issue", identifier: "TST-11", title: "Test", status: "todo" }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    await mapper.handleMessage(makeTelegramMessage({ text: "/new Auto-assigned issue" }));
+
+    const issueCall = fetchSpy.mock.calls.find(
+      ([url]) => typeof url === "string" && url.includes("/api/companies/") && url.includes("/issues")
+    );
+    expect(issueCall).toBeDefined();
+    const body = JSON.parse(issueCall![1]!.body as string);
+    expect(body.assigneeAgentId).toBe(targetAgent);
+    fetchSpy.mockRestore();
+  });
+
+  it("omits assigneeAgentId when topic is not in topicAgentMap", async () => {
+    const { mapper, store } = buildTestMapperWithAgentMap({ "999": "agent-for-other-topic" });
+
+    await store.saveTopicMapping({
+      messageThreadId: 100,
+      projectId: "proj-001",
+      projectName: "Test Project",
+      createdAt: new Date().toISOString(),
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ id: "new-issue", identifier: "TST-12", title: "Test", status: "todo" }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    await mapper.handleMessage(makeTelegramMessage({ text: "No auto-assign for this topic" }));
+
+    const issueCall = fetchSpy.mock.calls.find(
+      ([url]) => typeof url === "string" && url.includes("/api/companies/") && url.includes("/issues")
+    );
+    expect(issueCall).toBeDefined();
+    const body = JSON.parse(issueCall![1]!.body as string);
+    expect(body.assigneeAgentId).toBeUndefined();
+    fetchSpy.mockRestore();
+  });
+
+  it("omits assigneeAgentId when topicAgentMap is not configured", async () => {
+    const { mapper, store } = buildTestMapper();
+
+    await store.saveTopicMapping({
+      messageThreadId: 100,
+      projectId: "proj-001",
+      projectName: "Test Project",
+      createdAt: new Date().toISOString(),
+    });
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ id: "new-issue", identifier: "TST-13", title: "Test", status: "todo" }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    await mapper.handleMessage(makeTelegramMessage({ text: "No agent map configured" }));
+
+    const issueCall = fetchSpy.mock.calls.find(
+      ([url]) => typeof url === "string" && url.includes("/api/companies/") && url.includes("/issues")
+    );
+    expect(issueCall).toBeDefined();
+    const body = JSON.parse(issueCall![1]!.body as string);
+    expect(body.assigneeAgentId).toBeUndefined();
+    fetchSpy.mockRestore();
   });
 });
