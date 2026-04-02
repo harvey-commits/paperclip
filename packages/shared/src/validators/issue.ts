@@ -53,6 +53,7 @@ export const createIssueSchema = z.object({
   ]).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
   originKind: z.enum(ISSUE_ORIGIN_KINDS).optional(),
+  originId: z.string().optional().nullable(),
   labelIds: z.array(z.string().uuid()).optional(),
 });
 
