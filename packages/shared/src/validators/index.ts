@@ -128,6 +128,7 @@ export {
   addIssueCommentSchema,
   linkIssueApprovalSchema,
   createIssueAttachmentMetadataSchema,
+  createIssueAttachmentFromUrlSchema,
   issueDocumentFormatSchema,
   issueDocumentKeySchema,
   upsertIssueDocumentSchema,
@@ -139,6 +140,7 @@ export {
   type AddIssueComment,
   type LinkIssueApproval,
   type CreateIssueAttachmentMetadata,
+  type CreateIssueAttachmentFromUrl,
   type IssueDocumentFormat,
   type UpsertIssueDocument,
 } from "./issue.js";

@@ -103,6 +103,14 @@ export const createIssueAttachmentMetadataSchema = z.object({
 
 export type CreateIssueAttachmentMetadata = z.infer<typeof createIssueAttachmentMetadataSchema>;
 
+export const createIssueAttachmentFromUrlSchema = z.object({
+  fileUrl: z.string().url(),
+  originalFilename: z.string().max(255).optional().nullable(),
+  issueCommentId: z.string().uuid().optional().nullable(),
+});
+
+export type CreateIssueAttachmentFromUrl = z.infer<typeof createIssueAttachmentFromUrlSchema>;
+
 export const ISSUE_DOCUMENT_FORMATS = ["markdown"] as const;
 
 export const issueDocumentFormatSchema = z.enum(ISSUE_DOCUMENT_FORMATS);

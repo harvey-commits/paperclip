@@ -71,4 +71,4 @@ export function isAllowedContentType(contentType: string): boolean {
 }
 
 export const MAX_ATTACHMENT_BYTES =
-  Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
+  Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) || 20 * 1024 * 1024; // 20 MB default (covers Telegram's 20 MB file limit)

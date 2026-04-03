@@ -5,6 +5,7 @@ import type { Db } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
   createIssueAttachmentMetadataSchema,
+  createIssueAttachmentFromUrlSchema,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
   checkoutIssueSchema,
@@ -1706,6 +1707,148 @@ export function issueRoutes(db: Db, storage: StorageService) {
         originalFilename: attachment.originalFilename,
         contentType: attachment.contentType,
         byteSize: attachment.byteSize,
+      },
+    });
+
+    res.status(201).json(withContentPath(attachment));
+  });
+
+  // URL-based upload: download a file from a URL and attach it to an issue.
+  // Useful for plugins (e.g. Telegram) that already have a download URL.
+  router.post("/companies/:companyId/issues/:issueId/attachments/from-url", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const issueId = req.params.issueId as string;
+    assertCompanyAccess(req, companyId);
+
+    const issue = await svc.getById(issueId);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    if (issue.companyId !== companyId) {
+      res.status(422).json({ error: "Issue does not belong to company" });
+      return;
+    }
+
+    const parsed = createIssueAttachmentFromUrlSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid request body", details: parsed.error.issues });
+      return;
+    }
+
+    const { fileUrl, originalFilename, issueCommentId } = parsed.data;
+
+    // Validate URL protocol (only http/https)
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(fileUrl);
+    } catch {
+      res.status(400).json({ error: "Invalid fileUrl" });
+      return;
+    }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      res.status(400).json({ error: "fileUrl must use http or https protocol" });
+      return;
+    }
+
+    // Download the file with size and timeout limits
+    const controller = new AbortController();
+    const downloadTimeout = setTimeout(() => controller.abort(), 30_000);
+    let fetchResp: Awaited<ReturnType<typeof globalThis.fetch>>;
+    try {
+      fetchResp = await globalThis.fetch(fileUrl, {
+        signal: controller.signal,
+        redirect: "follow",
+      });
+    } catch (err) {
+      clearTimeout(downloadTimeout);
+      const message = err instanceof Error && err.name === "AbortError"
+        ? "File download timed out"
+        : "Failed to download file from URL";
+      res.status(422).json({ error: message });
+      return;
+    }
+    clearTimeout(downloadTimeout);
+
+    if (!fetchResp.ok) {
+      res.status(422).json({ error: `File download failed with status ${fetchResp.status}` });
+      return;
+    }
+
+    const contentLengthHeader = fetchResp.headers.get("content-length");
+    if (contentLengthHeader && Number(contentLengthHeader) > MAX_ATTACHMENT_BYTES) {
+      res.status(422).json({ error: `File exceeds ${MAX_ATTACHMENT_BYTES} bytes` });
+      return;
+    }
+
+    let buffer: Buffer;
+    try {
+      const arrayBuffer = await fetchResp.arrayBuffer();
+      buffer = Buffer.from(arrayBuffer);
+    } catch {
+      res.status(422).json({ error: "Failed to read file content" });
+      return;
+    }
+
+    if (buffer.length > MAX_ATTACHMENT_BYTES) {
+      res.status(422).json({ error: `File exceeds ${MAX_ATTACHMENT_BYTES} bytes` });
+      return;
+    }
+    if (buffer.length <= 0) {
+      res.status(422).json({ error: "Downloaded file is empty" });
+      return;
+    }
+
+    // Determine content type from response headers
+    const contentType = (fetchResp.headers.get("content-type") || "application/octet-stream")
+      .split(";")[0]!.trim().toLowerCase();
+    if (!isAllowedContentType(contentType)) {
+      res.status(422).json({ error: `Unsupported attachment type: ${contentType}` });
+      return;
+    }
+
+    // Derive filename from explicit param or URL path
+    const derivedFilename =
+      originalFilename ??
+      (decodeURIComponent(parsedUrl.pathname.split("/").pop() || "") || null);
+
+    const actor = getActorInfo(req);
+    const stored = await storage.putFile({
+      companyId,
+      namespace: `issues/${issueId}`,
+      originalFilename: derivedFilename,
+      contentType,
+      body: buffer,
+    });
+
+    const attachment = await svc.createAttachment({
+      issueId,
+      issueCommentId: issueCommentId ?? null,
+      provider: stored.provider,
+      objectKey: stored.objectKey,
+      contentType: stored.contentType,
+      byteSize: stored.byteSize,
+      sha256: stored.sha256,
+      originalFilename: stored.originalFilename,
+      createdByAgentId: actor.agentId,
+      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+    });
+
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.attachment_added",
+      entityType: "issue",
+      entityId: issueId,
+      details: {
+        attachmentId: attachment.id,
+        originalFilename: attachment.originalFilename,
+        contentType: attachment.contentType,
+        byteSize: attachment.byteSize,
+        source: "url",
       },
     });
 
