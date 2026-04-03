@@ -49,6 +49,13 @@ class RateLimiter {
 const RATE_LIMIT_PER_TOPIC = 10;
 
 /**
+ * Sentinel thread ID used in store keys for the Telegram forum "General" topic.
+ * General topic messages have message_thread_id === undefined; we normalise
+ * to this value for consistent thread-latest lookups and project resolution.
+ */
+const GENERAL_TOPIC_THREAD_ID = 0;
+
+/**
  * Handles the mapping logic between Telegram messages and Paperclip issues/comments.
  */
 export class MessageMapper {
@@ -130,7 +137,7 @@ export class MessageMapper {
     // or a new top-level message in a topic (→ new issue)
     if (message.reply_to_message && !message.reply_to_message.forum_topic_created) {
       await this.handleReply(message);
-    } else if (message.message_thread_id) {
+    } else {
       await this.handleTopLevelMessage(message);
     }
   }
@@ -341,7 +348,8 @@ export class MessageMapper {
 
     // Check for an existing open issue in this thread before creating a new one.
     // If found, append the message as a comment instead.
-    const threadMapping = await this.store.getLatestIssueByThread(message.message_thread_id!);
+    const effectiveThreadId = message.message_thread_id ?? GENERAL_TOPIC_THREAD_ID;
+    const threadMapping = await this.store.getLatestIssueByThread(effectiveThreadId);
     if (threadMapping) {
       try {
         const existingIssue = await this.ctx.issues.get(
@@ -863,10 +871,8 @@ export class MessageMapper {
     if (message.reply_to_message && !message.reply_to_message.forum_topic_created) {
       return this.resolveIssueForReply(message);
     }
-    if (message.message_thread_id !== undefined) {
-      return this.store.getLatestIssueByThread(message.message_thread_id);
-    }
-    return null;
+    const effectiveThreadId = message.message_thread_id ?? GENERAL_TOPIC_THREAD_ID;
+    return this.store.getLatestIssueByThread(effectiveThreadId);
   }
 
   /**
@@ -894,17 +900,14 @@ export class MessageMapper {
     }
 
     // 3. Thread-level fallback — find the most recently mapped issue in this thread
-    if (message.message_thread_id !== undefined) {
-      const threadFallback = await this.store.getLatestIssueByThread(
-        message.message_thread_id
-      );
-      if (threadFallback) {
-        this.ctx.logger.debug("Using thread-level fallback for nested reply", {
-          threadId: message.message_thread_id,
-          fallbackIssueId: threadFallback.paperclipIssueId,
-        });
-        return threadFallback;
-      }
+    const effectiveThreadId = message.message_thread_id ?? GENERAL_TOPIC_THREAD_ID;
+    const threadFallback = await this.store.getLatestIssueByThread(effectiveThreadId);
+    if (threadFallback) {
+      this.ctx.logger.debug("Using thread-level fallback for nested reply", {
+        threadId: message.message_thread_id,
+        fallbackIssueId: threadFallback.paperclipIssueId,
+      });
+      return threadFallback;
     }
 
     return null;
@@ -927,20 +930,20 @@ export class MessageMapper {
   private async resolveProjectForTopic(
     threadId: number | undefined
   ): Promise<string | null> {
-    if (threadId === undefined) return null;
+    const effectiveId = threadId ?? GENERAL_TOPIC_THREAD_ID;
 
     // 1. Check static config mapping
     const staticMap = this.config.topicProjectMap ?? {};
-    const staticProjectId = staticMap[String(threadId)];
+    const staticProjectId = staticMap[String(effectiveId)];
     if (staticProjectId) return staticProjectId;
 
     // 2. Check stored mapping
-    const stored = await this.store.getProjectByTopic(threadId);
+    const stored = await this.store.getProjectByTopic(effectiveId);
     if (stored) return stored.projectId;
 
     // 3. Auto-create if enabled
     if (this.config.autoCreateProjects !== false) {
-      return this.autoCreateProject(threadId);
+      return this.autoCreateProject(effectiveId);
     }
 
     return null;
@@ -962,7 +965,9 @@ export class MessageMapper {
             Authorization: `Bearer ${this.config.paperclipApiKey}`,
           },
           body: JSON.stringify({
-            name: `Telegram Topic ${threadId}`,
+            name: threadId === GENERAL_TOPIC_THREAD_ID
+              ? "Telegram General"
+              : `Telegram Topic ${threadId}`,
             status: "active",
           }),
         }

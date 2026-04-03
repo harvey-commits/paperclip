@@ -58,10 +58,10 @@ export class MappingStore {
       },
       mapping
     );
-    // Update thread-level latest issue index for nested reply fallback
-    if (mapping.messageThreadId !== undefined) {
-      await this.saveThreadLatestIssue(mapping.messageThreadId, mapping);
-    }
+    // Update thread-level latest issue index for nested reply fallback.
+    // Use 0 as the sentinel key for the General topic (messageThreadId === undefined).
+    const threadKey = mapping.messageThreadId ?? 0;
+    await this.saveThreadLatestIssue(threadKey, mapping);
   }
 
   async getMessageByIssue(
