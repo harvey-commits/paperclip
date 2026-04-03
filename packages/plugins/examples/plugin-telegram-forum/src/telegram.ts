@@ -1,6 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type {
   TelegramForumConfig,
+  TelegramGetFileResult,
   TelegramGetUpdatesResult,
   TelegramSendMessageResult,
   TelegramUpdate,
@@ -38,13 +39,19 @@ export class TelegramClient {
     return `${TELEGRAM_API_BASE}/bot${this.token}/${method}`;
   }
 
-  /** Token-safe fetch wrapper. Redacts the bot token from any thrown errors. */
+  /**
+   * Token-safe fetch wrapper. Uses the native global fetch() directly to
+   * avoid the host-side http.fetch RPC which suffers from an IPC
+   * "not writable" race condition after worker restarts.
+   *
+   * Redacts the bot token from any thrown errors.
+   */
   private async safeFetch(
     url: string,
     init?: RequestInit
   ): Promise<Response> {
     try {
-      return await this.ctx.http.fetch(url, init);
+      return await fetch(url, init);
     } catch (err) {
       if (err instanceof Error) {
         const safe = new Error(redactBotToken(err.message, this.token));
@@ -129,6 +136,49 @@ export class TelegramClient {
       return null;
     }
   }
+
+  /**
+   * Get file info from Telegram using getFile API.
+   * Returns the file_path needed to download the file, or null on failure.
+   */
+  async getFile(fileId: string): Promise<string | null> {
+    const params = new URLSearchParams({ file_id: fileId });
+    const resp = await this.safeFetch(
+      `${this.url("getFile")}?${params.toString()}`
+    );
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      this.ctx.logger.error("getFile failed", {
+        status: resp.status,
+        body: redactBotToken(body, this.token),
+      });
+      return null;
+    }
+
+    const data = (await resp.json()) as TelegramGetFileResult;
+    return data.ok ? (data.result?.file_path ?? null) : null;
+  }
+
+  /**
+   * Download a file from Telegram's file storage.
+   * @param filePath - The file_path returned by getFile.
+   * @returns The raw file bytes, or null on failure.
+   */
+  async downloadFile(filePath: string): Promise<Uint8Array | null> {
+    const fileUrl = `${TELEGRAM_API_BASE}/file/bot${this.token}/${filePath}`;
+    const resp = await this.safeFetch(fileUrl);
+
+    if (!resp.ok) {
+      this.ctx.logger.error("File download failed", {
+        status: resp.status,
+        filePath,
+      });
+      return null;
+    }
+
+    return new Uint8Array(await resp.arrayBuffer());
+  }
 }
 
 /**
@@ -147,6 +197,10 @@ export function startPolling(
   const intervalMs = config.pollingIntervalMs ?? 2000;
 
   async function poll() {
+    // Delay to let the IPC channel stabilize and any stale RPCs from
+    // previous worker instances to drain before starting network calls.
+    await sleep(3000);
+
     // Load persisted offset on startup
     if (store) {
       try {
@@ -163,7 +217,7 @@ export function startPolling(
 
     while (running) {
       try {
-        const updates = await client.getUpdates(offset, 30);
+        const updates = await client.getUpdates(offset, 0);
         for (const update of updates) {
           offset = update.update_id + 1;
           try {
@@ -192,6 +246,8 @@ export function startPolling(
         // Back off on error
         await sleep(intervalMs * 2);
       }
+      // Short poll interval between successful fetches
+      await sleep(intervalMs);
     }
   }
 

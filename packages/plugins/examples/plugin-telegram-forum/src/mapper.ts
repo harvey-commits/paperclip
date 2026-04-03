@@ -2,6 +2,7 @@ import type { PluginContext, PluginEvent } from "@paperclipai/plugin-sdk";
 import type {
   TelegramForumConfig,
   TelegramMessage,
+  TelegramFileInfo,
   PaperclipIssueResponse,
 } from "./types.js";
 import type { MappingStore } from "./store.js";
@@ -55,6 +56,66 @@ const RATE_LIMIT_PER_TOPIC = 10;
  */
 const GENERAL_TOPIC_THREAD_ID = 0;
 
+/** Max file size accepted by Paperclip (10 MB). */
+const MAX_PAPERCLIP_FILE_SIZE = 10 * 1024 * 1024;
+
+/**
+ * Extract file info from a Telegram message.
+ * For photos, uses the largest available size (last element in the array).
+ */
+export function extractFileInfo(msg: TelegramMessage): TelegramFileInfo | null {
+  if (msg.photo && msg.photo.length > 0) {
+    const largest = msg.photo[msg.photo.length - 1];
+    return {
+      fileId: largest.file_id,
+      fileName: `photo_${largest.file_unique_id}.jpg`,
+      mimeType: "image/jpeg",
+      fileSize: largest.file_size,
+    };
+  }
+  if (msg.document) {
+    return {
+      fileId: msg.document.file_id,
+      fileName: msg.document.file_name ?? `document_${msg.document.file_unique_id}`,
+      mimeType: msg.document.mime_type ?? "application/octet-stream",
+      fileSize: msg.document.file_size,
+    };
+  }
+  if (msg.video) {
+    return {
+      fileId: msg.video.file_id,
+      fileName: msg.video.file_name ?? `video_${msg.video.file_unique_id}.mp4`,
+      mimeType: msg.video.mime_type ?? "video/mp4",
+      fileSize: msg.video.file_size,
+    };
+  }
+  if (msg.audio) {
+    return {
+      fileId: msg.audio.file_id,
+      fileName: msg.audio.file_name ?? `audio_${msg.audio.file_unique_id}.mp3`,
+      mimeType: msg.audio.mime_type ?? "audio/mpeg",
+      fileSize: msg.audio.file_size,
+    };
+  }
+  if (msg.voice) {
+    return {
+      fileId: msg.voice.file_id,
+      fileName: `voice_${msg.voice.file_unique_id}.ogg`,
+      mimeType: msg.voice.mime_type ?? "audio/ogg",
+      fileSize: msg.voice.file_size,
+    };
+  }
+  if (msg.video_note) {
+    return {
+      fileId: msg.video_note.file_id,
+      fileName: `videonote_${msg.video_note.file_unique_id}.mp4`,
+      mimeType: "video/mp4",
+      fileSize: msg.video_note.file_size,
+    };
+  }
+  return null;
+}
+
 /**
  * Handles the mapping logic between Telegram messages and Paperclip issues/comments.
  */
@@ -85,8 +146,9 @@ export class MessageMapper {
     // Ignore messages from bots (our own bot's replies)
     if (message.from?.is_bot) return;
 
-    // Ignore non-text messages
-    if (!message.text) return;
+    // Ignore messages with no text, caption, or file attachment
+    const fileInfo = extractFileInfo(message);
+    if (!message.text && !message.caption && !fileInfo) return;
 
     // Ignore service messages (topic created, etc.)
     if (message.forum_topic_created) return;
@@ -104,31 +166,31 @@ export class MessageMapper {
     }
 
     // Check for /whoami command
-    if (message.text.startsWith("/whoami")) {
+    if (message.text?.startsWith("/whoami")) {
       await this.handleWhoamiCommand(message);
       return;
     }
 
     // Check for /new command
-    if (message.text.startsWith("/new ")) {
+    if (message.text?.startsWith("/new ")) {
       await this.handleNewCommand(message);
       return;
     }
 
     // Check for /status command
-    if (message.text === "/status" || message.text.startsWith("/status ")) {
+    if (message.text === "/status" || message.text?.startsWith("/status ")) {
       await this.handleStatusCommand(message);
       return;
     }
 
     // Check for /assign command
-    if (message.text.startsWith("/assign ")) {
+    if (message.text?.startsWith("/assign ")) {
       await this.handleAssignCommand(message);
       return;
     }
 
     // Check for /close command
-    if (message.text === "/close" || message.text.startsWith("/close ")) {
+    if (message.text === "/close" || message.text?.startsWith("/close ")) {
       await this.handleCloseCommand(message);
       return;
     }
@@ -359,13 +421,28 @@ export class MessageMapper {
         if (existingIssue && existingIssue.status !== "done" && existingIssue.status !== "cancelled") {
           const senderName = formatSenderName(message);
           const userId = await this.resolveUserId(message);
-          const commentBody = `**${senderName}** (via Telegram):\n\n${sanitizeInput(message.text!)}`;
+          const msgText = message.text ?? message.caption ?? "";
+          const commentBody = msgText
+            ? `**${senderName}** (via Telegram):\n\n${sanitizeInput(msgText)}`
+            : null;
 
-          await this.createPaperclipComment(
-            threadMapping.paperclipIssueId,
-            commentBody,
-            userId
-          );
+          if (commentBody) {
+            await this.createPaperclipComment(
+              threadMapping.paperclipIssueId,
+              commentBody,
+              userId
+            );
+          }
+
+          // Upload file attachment if present
+          const existingFileInfo = extractFileInfo(message);
+          if (existingFileInfo) {
+            await this.uploadFileToIssue(
+              threadMapping.paperclipIssueId,
+              message,
+              existingFileInfo
+            );
+          }
 
           await this.store.saveMessageMapping({
             telegramMessageId: message.message_id,
@@ -391,9 +468,17 @@ export class MessageMapper {
       }
     }
 
-    const title = truncate(sanitizeInput(message.text!), 100);
+    const msgText = message.text ?? message.caption ?? "";
+    const newFileInfo = extractFileInfo(message);
+    const titleSource = msgText || (newFileInfo ? `File: ${newFileInfo.fileName}` : "Telegram message");
+    const title = truncate(sanitizeInput(titleSource), 100);
     const senderName = formatSenderName(message);
-    const description = `${sanitizeInput(message.text!)}\n\n---\n_Sent by ${senderName} in Telegram_`;
+    const descParts = [sanitizeInput(msgText || titleSource)];
+    if (newFileInfo) {
+      descParts.push(`\n\n**Attached file:** ${sanitizeInput(newFileInfo.fileName)} (${newFileInfo.mimeType})`);
+    }
+    descParts.push(`\n\n---\n_Sent by ${senderName} in Telegram_`);
+    const description = descParts.join("");
     const createdByUserId = await this.resolveUserId(message);
     const assigneeAgentId = this.resolveAgentForTopic(message.message_thread_id);
 
@@ -417,10 +502,16 @@ export class MessageMapper {
         createdAt: new Date().toISOString(),
       });
 
+      // Upload file attachment if present
+      if (newFileInfo) {
+        await this.uploadFileToIssue(issue.id, message, newFileInfo);
+      }
+
       this.ctx.logger.info("Created issue from Telegram message", {
         issueId: issue.id,
         identifier: issue.identifier,
         messageId: message.message_id,
+        hasFile: !!newFileInfo,
       });
     }
   }
@@ -463,14 +554,28 @@ export class MessageMapper {
 
     const senderName = formatSenderName(message);
     const userId = await this.resolveUserId(message);
-    const commentBody = `**${senderName}** (via Telegram):\n\n${sanitizeInput(message.text!)}`;
+    const replyText = message.text ?? message.caption ?? "";
+    const replyFileInfo = extractFileInfo(message);
 
     try {
-      await this.createPaperclipComment(
-        mapping.paperclipIssueId,
-        commentBody,
-        userId
-      );
+      // Post text/caption as comment if present
+      if (replyText) {
+        const commentBody = `**${senderName}** (via Telegram):\n\n${sanitizeInput(replyText)}`;
+        await this.createPaperclipComment(
+          mapping.paperclipIssueId,
+          commentBody,
+          userId
+        );
+      }
+
+      // Upload file attachment if present
+      if (replyFileInfo) {
+        await this.uploadFileToIssue(
+          mapping.paperclipIssueId,
+          message,
+          replyFileInfo
+        );
+      }
 
       // Save mapping for the reply message to enable dedup and threading
       await this.store.saveMessageMapping({
@@ -485,6 +590,7 @@ export class MessageMapper {
       this.ctx.logger.info("Posted Telegram reply as comment", {
         issueId: mapping.paperclipIssueId,
         messageId: message.message_id,
+        hasFile: !!replyFileInfo,
       });
     } catch (err) {
       this.ctx.logger.error("Failed to create comment", {
@@ -1095,6 +1201,124 @@ export class MessageMapper {
       const respBody = await resp.text();
       throw new Error(`Failed to create comment (${resp.status}): ${respBody}`);
     }
+  }
+
+  /**
+   * Download a file from Telegram and upload it as an attachment on a Paperclip issue.
+   * Posts a comment noting the attachment and includes the Telegram caption if present.
+   * Returns true on success, false on failure.
+   */
+  async uploadFileToIssue(
+    issueId: string,
+    message: TelegramMessage,
+    fileInfo: TelegramFileInfo
+  ): Promise<boolean> {
+    // Check file size before downloading
+    if (fileInfo.fileSize && fileInfo.fileSize > MAX_PAPERCLIP_FILE_SIZE) {
+      this.ctx.logger.warn("File exceeds Paperclip size limit — skipping upload", {
+        fileName: fileInfo.fileName,
+        fileSize: fileInfo.fileSize,
+        limit: MAX_PAPERCLIP_FILE_SIZE,
+      });
+      return false;
+    }
+
+    // Step 1: Get file path from Telegram
+    const filePath = await this.telegram.getFile(fileInfo.fileId);
+    if (!filePath) {
+      this.ctx.logger.error("Telegram getFile returned no file_path", {
+        fileId: fileInfo.fileId,
+      });
+      return false;
+    }
+
+    // Step 2: Download the file binary
+    const fileData = await this.telegram.downloadFile(filePath);
+    if (!fileData) {
+      this.ctx.logger.error("Failed to download file from Telegram", {
+        filePath,
+      });
+      return false;
+    }
+
+    // Double-check actual downloaded size
+    if (fileData.length > MAX_PAPERCLIP_FILE_SIZE) {
+      this.ctx.logger.warn("Downloaded file exceeds Paperclip size limit", {
+        fileName: fileInfo.fileName,
+        actualSize: fileData.length,
+        limit: MAX_PAPERCLIP_FILE_SIZE,
+      });
+      return false;
+    }
+
+    // Step 3: Upload to Paperclip as multipart form data
+    const boundary = `----PaperclipUpload${Date.now()}`;
+    const encoder = new TextEncoder();
+    const header = encoder.encode(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileInfo.fileName}"\r\nContent-Type: ${fileInfo.mimeType}\r\n\r\n`
+    );
+    const footer = encoder.encode(`\r\n--${boundary}--\r\n`);
+
+    const body = new Uint8Array(header.length + fileData.length + footer.length);
+    body.set(header, 0);
+    body.set(fileData, header.length);
+    body.set(footer, header.length + fileData.length);
+
+    try {
+      const uploadResp = await fetch(
+        `${this.config.paperclipApiUrl}/api/companies/${this.config.paperclipCompanyId}/issues/${issueId}/attachments`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            Authorization: `Bearer ${this.config.paperclipApiKey}`,
+          },
+          body,
+        }
+      );
+
+      if (!uploadResp.ok) {
+        const respBody = await uploadResp.text();
+        this.ctx.logger.error("Failed to upload file to Paperclip", {
+          issueId,
+          fileName: fileInfo.fileName,
+          status: uploadResp.status,
+          body: respBody,
+        });
+        return false;
+      }
+
+      this.ctx.logger.info("File uploaded to Paperclip issue", {
+        issueId,
+        fileName: fileInfo.fileName,
+      });
+    } catch (err) {
+      this.ctx.logger.error("File upload error", {
+        issueId,
+        fileName: fileInfo.fileName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+
+    // Step 4: Post a comment noting the file attachment
+    const senderName = formatSenderName(message);
+    const captionLine = message.caption
+      ? `\n\n> ${sanitizeInput(message.caption)}`
+      : "";
+    const commentBody = `**${senderName}** attached a file via Telegram: **${sanitizeInput(fileInfo.fileName)}** (${fileInfo.mimeType})${captionLine}`;
+
+    try {
+      const userId = await this.resolveUserId(message);
+      await this.createPaperclipComment(issueId, commentBody, userId);
+    } catch (err) {
+      this.ctx.logger.warn("File uploaded but comment creation failed", {
+        issueId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    return true;
   }
 }
 
