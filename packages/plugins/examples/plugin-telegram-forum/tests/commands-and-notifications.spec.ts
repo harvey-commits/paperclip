@@ -169,6 +169,11 @@ function makeTelegramMessage(
   };
 }
 
+/** Seed a Telegram→Paperclip user mapping so auth checks pass. */
+async function seedUserMapping(store: MappingStore): Promise<void> {
+  await store.setUserMapping("99001", "paperclip-user-001", "Alice Smith");
+}
+
 async function seedMapping(store: MappingStore): Promise<void> {
   await store.saveMessageMapping({
     telegramMessageId: ORIGIN_MESSAGE_ID,
@@ -179,6 +184,84 @@ async function seedMapping(store: MappingStore): Promise<void> {
     createdAt: new Date().toISOString(),
   });
 }
+
+// ── /assign auth boundary (unmapped user) ──────────────────────
+describe("/assign auth boundary", () => {
+  it("rejects unmapped user with auth error", async () => {
+    const { mapper, store, sendMessageSpy, harness } = buildTestMapper();
+    await seedMapping(store);
+    // Do NOT seed user mapping
+
+    const updateSpy = vi.spyOn(harness.ctx.issues, "update");
+
+    await mapper.handleMessage(
+      makeTelegramMessage({ text: "/assign @test-agent" })
+    );
+
+    // Should NOT have called issues.update
+    expect(updateSpy).not.toHaveBeenCalled();
+    // Should reply with auth error
+    expect(sendMessageSpy).toHaveBeenCalledOnce();
+    const [, text] = sendMessageSpy.mock.calls[0];
+    expect(text).toContain("linked to a Paperclip account");
+  });
+});
+
+// ── /close auth boundary (unmapped user) ───────────────────────
+describe("/close auth boundary", () => {
+  it("rejects unmapped user with auth error", async () => {
+    const { mapper, store, sendMessageSpy, harness } = buildTestMapper();
+    await seedMapping(store);
+    // Do NOT seed user mapping
+
+    const updateSpy = vi.spyOn(harness.ctx.issues, "update");
+
+    await mapper.handleMessage(makeTelegramMessage({ text: "/close" }));
+
+    // Should NOT have updated the issue
+    expect(updateSpy).not.toHaveBeenCalled();
+    // Should reply with auth error
+    expect(sendMessageSpy).toHaveBeenCalledOnce();
+    const [, text] = sendMessageSpy.mock.calls[0];
+    expect(text).toContain("linked to a Paperclip account");
+  });
+});
+
+// ── Rate limiting ──────────────────────────────────────────────
+describe("rate limiting", () => {
+  it("throttles rapid /status commands in the same topic", async () => {
+    const { mapper, store, sendMessageSpy } = buildTestMapper();
+    await seedMapping(store);
+
+    // Send RATE_LIMIT_PER_TOPIC (10) + 1 commands in rapid succession
+    for (let i = 0; i < 11; i++) {
+      await mapper.handleMessage(
+        makeTelegramMessage({ message_id: 600 + i, text: "/status" })
+      );
+    }
+
+    // The 11th command should have been throttled (only 10 allowed per minute per topic)
+    expect(sendMessageSpy.mock.calls.length).toBeLessThanOrEqual(10);
+  });
+
+  it("throttles rapid /close commands in the same topic", async () => {
+    const { mapper, store, sendMessageSpy, harness } = buildTestMapper();
+    await seedMapping(store);
+    await seedUserMapping(store);
+
+    const updateSpy = vi.spyOn(harness.ctx.issues, "update");
+
+    // Send 11 /close commands
+    for (let i = 0; i < 11; i++) {
+      await mapper.handleMessage(
+        makeTelegramMessage({ message_id: 700 + i, text: "/close" })
+      );
+    }
+
+    // Updates should be limited to at most 10
+    expect(updateSpy.mock.calls.length).toBeLessThanOrEqual(10);
+  });
+});
 
 // ── /status command ──────────────────────────────────────────────
 
@@ -257,6 +340,7 @@ describe("/assign command", () => {
       extraAgents: [secondAgent],
     });
     await seedMapping(store);
+    await seedUserMapping(store);
 
     const updateSpy = vi.spyOn(harness.ctx.issues, "update");
 
@@ -279,6 +363,7 @@ describe("/assign command", () => {
   it("replies with error when agent not found", async () => {
     const { mapper, store, sendMessageSpy } = buildTestMapper();
     await seedMapping(store);
+    await seedUserMapping(store);
 
     await mapper.handleMessage(
       makeTelegramMessage({ text: "/assign @nonexistent" })
@@ -290,7 +375,8 @@ describe("/assign command", () => {
   });
 
   it("replies with usage when no agent name provided", async () => {
-    const { mapper, sendMessageSpy } = buildTestMapper();
+    const { mapper, store, sendMessageSpy } = buildTestMapper();
+    await seedUserMapping(store);
 
     await mapper.handleMessage(makeTelegramMessage({ text: "/assign " }));
 
@@ -300,7 +386,8 @@ describe("/assign command", () => {
   });
 
   it("replies with error when no linked issue", async () => {
-    const { mapper, sendMessageSpy } = buildTestMapper();
+    const { mapper, store, sendMessageSpy } = buildTestMapper();
+    await seedUserMapping(store);
 
     await mapper.handleMessage(
       makeTelegramMessage({ text: "/assign @test-agent" })
@@ -314,6 +401,7 @@ describe("/assign command", () => {
   it("matches agent by name (case-insensitive)", async () => {
     const { mapper, store, sendMessageSpy, harness } = buildTestMapper();
     await seedMapping(store);
+    await seedUserMapping(store);
 
     const updateSpy = vi.spyOn(harness.ctx.issues, "update");
 
@@ -338,6 +426,7 @@ describe("/close command", () => {
   it("marks issue as done and replies with confirmation", async () => {
     const { mapper, store, sendMessageSpy, harness } = buildTestMapper();
     await seedMapping(store);
+    await seedUserMapping(store);
 
     const updateSpy = vi.spyOn(harness.ctx.issues, "update");
 
@@ -357,6 +446,7 @@ describe("/close command", () => {
   it("marks status change as plugin-initiated for loop prevention", async () => {
     const { mapper, store } = buildTestMapper();
     await seedMapping(store);
+    await seedUserMapping(store);
 
     await mapper.handleMessage(makeTelegramMessage({ text: "/close" }));
 
@@ -364,7 +454,8 @@ describe("/close command", () => {
   });
 
   it("replies with error when no linked issue", async () => {
-    const { mapper, sendMessageSpy } = buildTestMapper();
+    const { mapper, store, sendMessageSpy } = buildTestMapper();
+    await seedUserMapping(store);
 
     await mapper.handleMessage(makeTelegramMessage({ text: "/close" }));
 
@@ -537,6 +628,34 @@ describe("handleIssueUpdated", () => {
     expect(sendMessageSpy).toHaveBeenCalledOnce();
     const [, text] = sendMessageSpy.mock.calls[0];
     expect(text).toContain("done");
+  });
+});
+
+// ── handleIssueUpdated bot message mapping ──────────────────────
+
+describe("handleIssueUpdated bot message mapping", () => {
+  it("saves message mapping for status notification so replies resolve to the issue", async () => {
+    const { mapper, store } = buildTestMapper();
+    await seedMapping(store);
+
+    await mapper.handleIssueUpdated(makeEvent({ payload: { status: "done" } }));
+
+    // The sent message should be mapped to the issue
+    const mapping = await store.getIssueByMessage(CHAT_ID, SENT_MESSAGE_ID);
+    expect(mapping).not.toBeNull();
+    expect(mapping!.paperclipIssueId).toBe(ISSUE_ID);
+    expect(mapping!.paperclipIssueIdentifier).toBe("TST-1");
+    expect(mapping!.messageThreadId).toBe(THREAD_ID);
+  });
+
+  it("does not save mapping when sendMessage fails", async () => {
+    const { mapper, store } = buildTestMapper({ sendMessageResult: null });
+    await seedMapping(store);
+
+    await mapper.handleIssueUpdated(makeEvent({ payload: { status: "done" } }));
+
+    const mapping = await store.getIssueByMessage(CHAT_ID, SENT_MESSAGE_ID);
+    expect(mapping).toBeNull();
   });
 });
 

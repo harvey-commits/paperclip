@@ -282,12 +282,26 @@ export class MessageMapper {
       });
 
       const label = issue.identifier ?? issue.id.slice(0, 8);
-      await this.telegram.sendMessage(
+      const confirmationId = await this.telegram.sendMessage(
         this.config.telegramChatId,
         `Issue ${label} created: ${title}`,
         message.message_thread_id,
         message.message_id
       );
+
+      // Save mapping for the confirmation message so replies to it
+      // resolve to the issue via direct parent lookup
+      if (confirmationId !== null) {
+        await this.store.markSentByPlugin(this.config.telegramChatId, confirmationId);
+        await this.store.saveMessageMapping({
+          telegramMessageId: confirmationId,
+          telegramChatId: String(message.chat.id),
+          messageThreadId: message.message_thread_id,
+          paperclipIssueId: issue.id,
+          paperclipIssueIdentifier: issue.identifier,
+          createdAt: new Date().toISOString(),
+        });
+      }
     }
   }
 
@@ -538,9 +552,17 @@ export class MessageMapper {
       originMessageId
     );
 
-    // Track the sent message for loop prevention
+    // Track the sent message for loop prevention and reply resolution
     if (sentMessageId !== null) {
       await this.store.markSentByPlugin(this.config.telegramChatId, sentMessageId);
+      await this.store.saveMessageMapping({
+        telegramMessageId: sentMessageId,
+        telegramChatId: this.config.telegramChatId,
+        messageThreadId,
+        paperclipIssueId: issueId,
+        paperclipIssueIdentifier: issue.identifier,
+        createdAt: new Date().toISOString(),
+      });
       this.ctx.logger.info("Pushed comment to Telegram", {
         issueId,
         sentMessageId,
@@ -819,6 +841,14 @@ export class MessageMapper {
 
     if (sentMessageId !== null) {
       await this.store.markSentByPlugin(this.config.telegramChatId, sentMessageId);
+      await this.store.saveMessageMapping({
+        telegramMessageId: sentMessageId,
+        telegramChatId: this.config.telegramChatId,
+        messageThreadId,
+        paperclipIssueId: issueId,
+        paperclipIssueIdentifier: issue.identifier,
+        createdAt: new Date().toISOString(),
+      });
     }
   }
 

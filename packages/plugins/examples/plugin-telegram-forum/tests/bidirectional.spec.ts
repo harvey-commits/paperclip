@@ -336,3 +336,49 @@ describe("MappingStore sentByPlugin", () => {
     expect(await store.isSentByPlugin(CHAT_ID, 222)).toBe(false);
   });
 });
+
+// ── Reply-to-bot-message mapping ─────────────────────────────────
+
+describe("handleCommentCreated bot message mapping", () => {
+  it("saves message mapping for sent comment so replies resolve to the issue", async () => {
+    const { mapper, store } = buildTestMapper();
+
+    // Pre-populate the reverse mapping
+    await store.saveMessageMapping({
+      telegramMessageId: ORIGIN_MESSAGE_ID,
+      telegramChatId: CHAT_ID,
+      messageThreadId: 100,
+      paperclipIssueId: ISSUE_ID,
+      paperclipIssueIdentifier: "TST-1",
+      createdAt: new Date().toISOString(),
+    });
+
+    await mapper.handleCommentCreated(makeEvent());
+
+    // The sent message (SENT_MESSAGE_ID) should now be mapped to the issue
+    const mapping = await store.getIssueByMessage(CHAT_ID, SENT_MESSAGE_ID);
+    expect(mapping).not.toBeNull();
+    expect(mapping!.paperclipIssueId).toBe(ISSUE_ID);
+    expect(mapping!.paperclipIssueIdentifier).toBe("TST-1");
+    expect(mapping!.messageThreadId).toBe(100);
+  });
+
+  it("does not save mapping when sendMessage fails", async () => {
+    const { mapper, store } = buildTestMapper({ sendMessageResult: null });
+
+    await store.saveMessageMapping({
+      telegramMessageId: ORIGIN_MESSAGE_ID,
+      telegramChatId: CHAT_ID,
+      messageThreadId: 100,
+      paperclipIssueId: ISSUE_ID,
+      paperclipIssueIdentifier: "TST-1",
+      createdAt: new Date().toISOString(),
+    });
+
+    await mapper.handleCommentCreated(makeEvent());
+
+    // Should not have saved a mapping for the failed send
+    const mapping = await store.getIssueByMessage(CHAT_ID, SENT_MESSAGE_ID);
+    expect(mapping).toBeNull();
+  });
+});
