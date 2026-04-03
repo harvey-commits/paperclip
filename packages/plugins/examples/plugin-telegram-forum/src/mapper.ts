@@ -140,6 +140,9 @@ export class MessageMapper {
    * and reply with their Paperclip userId and display name, or "not mapped yet".
    */
   private async handleWhoamiCommand(message: TelegramMessage): Promise<void> {
+    const topicKey = `topic:${message.message_thread_id ?? "general"}`;
+    if (!this.rateLimiter.allow(topicKey)) return;
+
     if (!message.from) {
       await this.telegram.sendMessage(
         this.config.telegramChatId,
@@ -170,6 +173,36 @@ export class MessageMapper {
       message.message_thread_id,
       message.message_id
     );
+  }
+
+  /**
+   * Check that the Telegram sender has a valid user mapping.
+   * Returns true if authorized, false (and sends error reply) if not.
+   */
+  private async requireUserMapping(
+    message: TelegramMessage
+  ): Promise<boolean> {
+    if (!message.from) {
+      await this.telegram.sendMessage(
+        this.config.telegramChatId,
+        "Could not identify your Telegram account.",
+        message.message_thread_id,
+        message.message_id
+      );
+      return false;
+    }
+
+    const telegramUserId = String(message.from.id);
+    const mapping = await this.store.getUserMapping(telegramUserId);
+    if (mapping) return true;
+
+    await this.telegram.sendMessage(
+      this.config.telegramChatId,
+      "You must be linked to a Paperclip account to use this command. Use /whoami to check your mapping.",
+      message.message_thread_id,
+      message.message_id
+    );
+    return false;
   }
 
   /**
@@ -226,6 +259,7 @@ export class MessageMapper {
     const senderName = formatSenderName(message);
     const description = `Created via Telegram /new command by ${senderName}`;
     const createdByUserId = await this.resolveUserId(message);
+    const assigneeAgentId = this.resolveAgentForTopic(message.message_thread_id);
 
     const issue = await this.createPaperclipIssue({
       title,
@@ -234,6 +268,7 @@ export class MessageMapper {
       chatId: String(message.chat.id),
       messageId: message.message_id,
       createdByUserId,
+      assigneeAgentId,
     });
 
     if (issue) {
@@ -290,10 +325,55 @@ export class MessageMapper {
       return;
     }
 
+    // Check for an existing open issue in this thread before creating a new one.
+    // If found, append the message as a comment instead.
+    const threadMapping = await this.store.getLatestIssueByThread(message.message_thread_id!);
+    if (threadMapping) {
+      try {
+        const existingIssue = await this.ctx.issues.get(
+          threadMapping.paperclipIssueId,
+          this.config.paperclipCompanyId
+        );
+        if (existingIssue && existingIssue.status !== "done" && existingIssue.status !== "cancelled") {
+          const senderName = formatSenderName(message);
+          const userId = await this.resolveUserId(message);
+          const commentBody = `**${senderName}** (via Telegram):\n\n${sanitizeInput(message.text!)}`;
+
+          await this.createPaperclipComment(
+            threadMapping.paperclipIssueId,
+            commentBody,
+            userId
+          );
+
+          await this.store.saveMessageMapping({
+            telegramMessageId: message.message_id,
+            telegramChatId: chatId,
+            messageThreadId: message.message_thread_id,
+            paperclipIssueId: threadMapping.paperclipIssueId,
+            paperclipIssueIdentifier: threadMapping.paperclipIssueIdentifier,
+            createdAt: new Date().toISOString(),
+          });
+
+          this.ctx.logger.info("Appended Telegram message as comment to existing issue", {
+            issueId: threadMapping.paperclipIssueId,
+            identifier: threadMapping.paperclipIssueIdentifier,
+            messageId: message.message_id,
+          });
+          return;
+        }
+      } catch (err) {
+        this.ctx.logger.warn("Failed to check existing issue, falling through to create new", {
+          issueId: threadMapping.paperclipIssueId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     const title = truncate(sanitizeInput(message.text!), 100);
     const senderName = formatSenderName(message);
     const description = `${sanitizeInput(message.text!)}\n\n---\n_Sent by ${senderName} in Telegram_`;
     const createdByUserId = await this.resolveUserId(message);
+    const assigneeAgentId = this.resolveAgentForTopic(message.message_thread_id);
 
     const issue = await this.createPaperclipIssue({
       title,
@@ -302,6 +382,7 @@ export class MessageMapper {
       chatId,
       messageId: message.message_id,
       createdByUserId,
+      assigneeAgentId,
     });
 
     if (issue) {
@@ -536,6 +617,9 @@ export class MessageMapper {
     const topicKey = `topic:${message.message_thread_id ?? "general"}`;
     if (!this.rateLimiter.allow(topicKey)) return;
 
+    // Authorization: require a valid user mapping
+    if (!(await this.requireUserMapping(message))) return;
+
     const rawArg = message.text!.slice("/assign ".length).trim();
     const agentName = rawArg.replace(/^@/, "");
     if (!agentName) {
@@ -607,6 +691,9 @@ export class MessageMapper {
     const topicKey = `topic:${message.message_thread_id ?? "general"}`;
     if (!this.rateLimiter.allow(topicKey)) return;
 
+    // Authorization: require a valid user mapping
+    if (!(await this.requireUserMapping(message))) return;
+
     const mapping = await this.resolveIssueForCommand(message);
     if (!mapping) {
       await this.telegram.sendMessage(
@@ -630,13 +717,6 @@ export class MessageMapper {
       // Track this status change as plugin-initiated for loop prevention
       await this.store.markPluginStatusChange(mapping.paperclipIssueId);
 
-      // Post a closing comment via API
-      await this.createPaperclipComment(
-        mapping.paperclipIssueId,
-        `Closed via Telegram /close command by ${senderName}.`,
-        await this.resolveUserId(message)
-      );
-
       const label = mapping.paperclipIssueIdentifier ?? mapping.paperclipIssueId.slice(0, 8);
       await this.telegram.sendMessage(
         this.config.telegramChatId,
@@ -644,6 +724,20 @@ export class MessageMapper {
         message.message_thread_id,
         message.message_id
       );
+
+      // Post a closing comment via API (best-effort — don't fail the command)
+      try {
+        await this.createPaperclipComment(
+          mapping.paperclipIssueId,
+          `Closed via Telegram /close command by ${senderName}.`,
+          await this.resolveUserId(message)
+        );
+      } catch (commentErr) {
+        this.ctx.logger.warn("Failed to post closing comment", {
+          issueId: mapping.paperclipIssueId,
+          error: commentErr instanceof Error ? commentErr.message : String(commentErr),
+        });
+      }
     } catch (err) {
       this.ctx.logger.error("Failed to handle /close command", {
         issueId: mapping.paperclipIssueId,
@@ -787,6 +881,16 @@ export class MessageMapper {
   }
 
   /**
+   * Resolve the Paperclip agent ID for a forum topic from static config.
+   * Returns null if no mapping exists (issue will be created without an assignee).
+   */
+  private resolveAgentForTopic(threadId: number | undefined): string | null {
+    if (threadId === undefined) return this.config.defaultAgentId ?? null;
+    const agentMap = this.config.topicAgentMap ?? {};
+    return agentMap[String(threadId)] ?? this.config.defaultAgentId ?? null;
+  }
+
+  /**
    * Resolve the Paperclip project ID for a forum topic.
    * Checks static config first, then stored mappings, then auto-creates if enabled.
    */
@@ -819,7 +923,7 @@ export class MessageMapper {
     threadId: number
   ): Promise<string | null> {
     try {
-      const resp = await this.ctx.http.fetch(
+      const resp = await fetch(
         `${this.config.paperclipApiUrl}/api/companies/${this.config.paperclipCompanyId}/projects`,
         {
           method: "POST",
@@ -877,6 +981,7 @@ export class MessageMapper {
     chatId: string;
     messageId: number;
     createdByUserId: string | null;
+    assigneeAgentId?: string | null;
   }): Promise<PaperclipIssueResponse | null> {
     try {
       const issueBody: Record<string, unknown> = {
@@ -891,8 +996,11 @@ export class MessageMapper {
       if (input.createdByUserId) {
         issueBody.createdByUserId = input.createdByUserId;
       }
+      if (input.assigneeAgentId) {
+        issueBody.assigneeAgentId = input.assigneeAgentId;
+      }
 
-      const resp = await this.ctx.http.fetch(
+      const resp = await fetch(
         `${this.config.paperclipApiUrl}/api/companies/${this.config.paperclipCompanyId}/issues`,
         {
           method: "POST",
@@ -936,7 +1044,7 @@ export class MessageMapper {
       commentBody.authorUserId = userId;
     }
 
-    const resp = await this.ctx.http.fetch(
+    const resp = await fetch(
       `${this.config.paperclipApiUrl}/api/issues/${issueId}/comments`,
       {
         method: "POST",
